@@ -4001,12 +4001,6 @@ def _swap_step_29b(self, symbol, snap, signals, weights, regime, sent, prices_sp
 
 SwapEngineRunner.step = _swap_step_29b
 print("[BÖLÜM 29B] Swap kapisi AKTIF | islem riski = spot x%.1f" % CONFIG.futures.risk_scale)
-
-# ============================================================
-# NİHAİ BAŞLATMA
-# ============================================================
-if __name__ == "__main__":
-    main()
 # ============================================================
 # BÖLÜM 28 — VERİM PAKETİ
 # 28.1 Zaman stopu: X saatte kâr <%Y olan pozisyon kapatılır (sermaye döngüsü)
@@ -4102,3 +4096,82 @@ def _pre28(symbol, snapshot, ind, portfolio, prices):
 RISK.pre_trade_checks = _pre28
 print(f"[BÖLÜM 28] AKTİF | zaman stopu: >{TIME_STOP_HOURS}sa & kâr<{TIME_STOP_MIN_PCT}% | "
       f"korelasyon: >{CORR_MAX} @ {CORR_MIN_POSITIONS}+ pozisyon")
+# ============================================================
+# BÖLÜM 29C — SWAP RİSK İZOLASYONU
+# Bug fix: swap kasasının günlük zarar/kilit hesapları ARTIK kendi
+# referansıyla yapılır (spot karışmaz). Kilit anahtarları ayrı:
+#   spot: lockout:YYYY-MM-DD  |  swap: lockout:swap:YYYY-MM-DD
+# ============================================================
+print("[BÖLÜM 29C] Swap risk izolasyonu yükleniyor...")
+
+class SwapRiskManager(RiskManagerV2):
+    def _lockout_flag(self):
+        return str(self.db.get_meta(f"lockout:swap:{utc_now().date()}", "") or "") == "1"
+
+    def _enter_daily_lockout(self, portfolio):
+        self.db.set_meta(f"lockout:swap:{utc_now().date()}", "1")
+        LOG.warning("[SWAP-RİSK] Günlük zarar limiti — vadeli girişler UTC günü sonuna kadar kilitli.")
+        TG.send("🔒 [SWAP-RİSK] Günlük zarar limiti — vadeli girişler kilitli.", "risk", force=True)
+
+SWAP_RISK = SwapRiskManager(CONFIG, DB)
+
+# Bug yüzünden yanlış tetiklenen günlük kilit temizliği (yalnız bugün için)
+try:
+    _k29c = f"lockout:{utc_now().date()}"
+    if str(DB.get_meta(_k29c, "") or "") == "1":
+        DB.set_meta(_k29c, "0")
+        LOG.warning("[29C] Yanlış tetiklenen günlük kilit temizlendi (%s).", _k29c)
+except Exception:
+    pass
+
+_orig_step_29c = _orig_swap_step29b
+_orig_psize_29c = _orig_psize29b
+
+def _swap_step_29c(self, symbol, snap, signals, weights, regime, sent, prices_spot):
+    # Gün referansı: SWAP kasasının kendi equity'si (spot değil!)
+    if self.pf and self.execution:
+        try:
+            SWAP_RISK.update_day_anchor(self.pf.equity({symbol: snap.get("last") or 0.0}))
+        except Exception:
+            pass
+    # Pozisyon YOKSA güvenlik kapısı (SWAP_RISK üzerinden — izole hesap)
+    if self.pf and self.execution and not self.pf.has(symbol):
+        try:
+            ind_g = {}
+            df_g = ENGINE.get_ohlcv(symbol, self.cfg.primary_timeframe, limit=60, min_candles=50)
+            _a = safe_float(atr(df_g).iloc[-1])
+            _p = snap.get("last") or 0.0
+            if _a and _p > 0:
+                ind_g["atr_pct"] = _a / _p * 100.0
+        except TradingSystemError:
+            ind_g = {}
+        try:
+            okg, whyg = SWAP_RISK.pre_trade_checks(symbol, snap, ind_g,
+                                                   _SwapGatePf(self.pf),
+                                                   {symbol: snap.get("last") or 0.0})
+            if not okg:
+                soft = [w for w in whyg if "hacim" not in w and "1h trend" not in w]
+                if soft:
+                    LOG.info("[SWAP][%s] giriş engellendi: %s", symbol, ", ".join(soft))
+                    return
+                LOG.info("[SWAP][%s] yumuşak engel geçildi: %s", symbol, ", ".join(whyg))
+        except Exception as e:
+            LOG.warning("[SWAP][%s] kapı hatası (giriş engellendi): %s", symbol, e)
+            return
+    # Boyutlandırma: risk_scale (0.5 = yarı risk)
+    def _scaled_psize(equity, price, stop_price, cons):
+        return _orig_psize_29c(equity * CONFIG.futures.risk_scale, price, stop_price, cons)
+    RISK.position_size = _scaled_psize
+    try:
+        return _orig_step_29c(self, symbol, snap, signals, weights, regime, sent, prices_spot)
+    finally:
+        RISK.position_size = _orig_psize_29c
+
+SwapEngineRunner.step = _swap_step_29c
+print("[BÖLÜM 29C] Swap risk izolasyonu AKTIF — kilit/limit hesapları swap kasasına göre ayrıştırıldı.")
+
+# ============================================================
+# NİHAİ BAŞLATMA (dosyanın EN SONU burası olmalı)
+# ============================================================
+if __name__ == "__main__":
+    main()
