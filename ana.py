@@ -4559,5 +4559,74 @@ if "TradingBotV3" in dir():
     TradingBotV3.start = _start30
 
 print("[BÖLÜM 30] Sağlamlaştırma paketi AKTİF — 14 alt sistem yüklendi.")
+# ============================================================
+# BÖLÜM 31 — AUDIT CONSOLIDATION (append-only)
+# 31.1 Tek swap kapısı: zincir 29C'ye sabitlenir (29B deprecated)
+# 31.2 SWAP_RISK: makro risk-off + acil nakit kapısı
+# 31.3 SERVER_SL kapanış temizliği (yetim trigger emir koruması)
+# ============================================================
+print("[BÖLÜM 31] Audit consolidation yükleniyor...")
+
+# ---- 31.1 tek yetkili swap kapısı ----
+try:
+    SwapEngineRunner.step = _swap_step_29c
+    _swap_step_29b.__doc__ = "DEPRECATED: tek yetkili kapı _swap_step_29c (SWAP_RISK) - 29C"
+    LOG.info("[31.1] Swap kapı zinciri konsolide edildi: tek kapı = _swap_step_29c.")
+except NameError as e:
+    LOG.warning("[31.1] konsolidasyon atlandı: %s", e)
+
+# ---- 31.2 SWAP_RISK kapı eklentileri ----
+_swap_risk_pre31 = SWAP_RISK.pre_trade_checks
+
+def _swap_risk_pre31(symbol, snapshot, ind, portfolio, prices):
+    ok, reasons = _swap_risk_pre31(symbol, snapshot, ind, portfolio, prices)
+    try:
+        if CONFIG.mode != TradingMode.BACKTEST:
+            if getattr(CONFIG, "macro", None) and CONFIG.macro.enabled:
+                if MACRO.is_event_day():
+                    return False, reasons + ["[SWAP] makro olay günü — giriş kapalı"]
+                s = MACRO.get_scalar(symbol)
+                if s < CONFIG.macro.block_below:
+                    return False, reasons + [f"[SWAP] makro risk-off (skala={s:.2f})"]
+        cash = getattr(portfolio, "cash", None)
+        if cash is None:
+            cash = getattr(getattr(portfolio, "_pf", None), "cash", 0.0) or 0.0
+        if cash and cash < CONFIG.risk.min_order_quote_usdt * 3.0:
+            return False, reasons + ["[SWAP] EMERGENCY SAFE MODE (nakit düşük)"]
+    except Exception as e:
+        LOG.debug("[31.2] swap kapı eki: %s", e)
+    return ok, reasons
+
+SWAP_RISK.pre_trade_checks = _swap_risk_pre31
+LOG.info("[31.2] SWAP_RISK: makro + acil nakit kapısı AKTİF.")
+
+# ---- 31.3 srv-SL kapanış temizliği ----
+def _cancel_srv_sl31(self, symbol):
+    try:
+        for o in (self.adapter.fetch_open_orders(symbol) or []):
+            blob = json.dumps({"c": o.get("clientOrderId"),
+                               "i": (o.get("info") or {}).get("clientOrderId")},
+                              default=str)
+            if "srv-sl" in blob:
+                try:
+                    self.adapter.cancel_order(o.get("id"), symbol)
+                    LOG.info("[31.3][%s] srv-SL emri iptal edildi (id=%s)", symbol, o.get("id"))
+                except TradingSystemError as e:
+                    LOG.warning("[31.3] iptal başarısız: %s", e)
+    except TradingSystemError as e:
+        LOG.warning("[31.3] açık emir sorgusu: %s", e)
+
+_mclose31_prev = ExecutionEngineV2.market_close
+
+def _mclose31(self, symbol, ref_price, reason):
+    if self.pf.mode == "live" and _SERVER_SL:
+        _cancel_srv_sl31(self, symbol)
+    return _mclose31_prev(self, symbol, ref_price, reason)
+
+ExecutionEngineV2.market_close = _mclose31
+LOG.info("[31.3] srv-SL kapanış temizliği bağlandı (SERVER_SL_ENABLED=%s).", _SERVER_SL)
+
+LOG.info("[31.4] Aktif zincirler: spot=V2(+28/30) | swap=29C(SWAP_RISK)+30 | main=V3(son tanım)")
+print("[BÖLÜM 31] Audit consolidation AKTİF.")
 if __name__ == "__main__":
     main()
