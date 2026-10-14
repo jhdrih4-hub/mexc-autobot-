@@ -3951,6 +3951,7 @@ print("[BÖLÜM 29B] Swap güvenlik kapısı bağlanıyor...")
 
 class _SwapGatePf:
     """pre_trade_checks için swap portföyü köprüsü."""
+    mode = "paper-swap"
     def __init__(self, pf):
         self._pf = pf
         self.positions = pf.positions if pf else {}
