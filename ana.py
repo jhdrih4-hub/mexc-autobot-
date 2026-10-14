@@ -4681,5 +4681,86 @@ else:
     del SWAP_RISK.pre_trade_checks
 
 print("[BÖLÜM 32] Swap kapı düzeltmesi TAMAM — makro + acil nakit kapısı korundu.")
+# ============================================================
+# BÖLÜM 32B — İki mantık bug'ının yaması (append-only)
+# 32B.1 Cache kirliliği: 30.7 volatilite ölçümü ana cache'i 30 mumla
+#      ezüyordu → BTC "yetersiz mum" hatası. Fix: ölçüm cache DIŞI yapılır.
+# 32B.2 Short kapısı: DecisionEngine pozisyon yokken HOLD döndürüyor,
+#      swap motoru SELL bekliyordu → short asla açılmıyordu.
+#      Fix: pozisyon-yok + skor≤satış-eşiği → action SELL'e çevrilir.
+#      Spot güvenli: SELL+pozisyon-yok durumunda spot hiçbir şey yapmaz.
+# ============================================================
+print("[BÖLÜM 32B] Mantık yamaları yükleniyor...")
+
+# ---- 32B.1 volatilite ölçümü cache-dışı ----
+def _btc_atr_pct_probe32b(timeframe):
+    """Cache'e YAZMADAN volatilite ölçer (ana veri kirletilmez)."""
+    try:
+        raw = ADAPTER.fetch_ohlcv_df("BTC/USDT", timeframe, 30)
+        closed = MarketDataEngine.to_closed(raw.copy(), timeframe)
+        if len(closed) < 20:
+            return None
+        a = safe_float(atr(closed).iloc[-1])
+        px = float(closed["close"].iloc[-1])
+        if _ok(a) and px > 0:
+            return a / px * 100.0
+    except TradingSystemError:
+        pass
+    return None
+
+# ---- 32B.2 DecisionEngine short kapısı ----
+_orig_decide32b = DECISION.decide
+
+_def_name = getattr(_orig_decide32b, "__name__", "?")
+if _def_name != "decide":
+    LOG.warning("[32B] Beklenmeyen referans (%s) — yama atlandı.", _def_name)
+else:
+    def _decide32b(symbol, snapshot, signals, weights, sentiment, has_position, regime):
+        d = _orig_decide32b(symbol, snapshot, signals, weights, sentiment,
+                            has_position, regime)
+        try:
+            if (d.action == "HOLD" and not has_position
+                    and d.score <= CONFIG.sell_score_threshold):
+                return Decision(ts=d.ts, symbol=d.symbol, action="SELL",
+                                score=d.score, confidence=d.confidence,
+                                reasons=d.reasons + ["SHORT sinyali (pozisyon yok)"],
+                                regime=d.regime, data_ok=d.data_ok)
+        except Exception as e:
+            LOG.debug("[32B] decide eki: %s", e)
+        return d
+
+    DECISION.decide = _decide32b
+    if _decide32b.__name__ != _orig_decide32b.__name__:
+        LOG.info("[32B.2] Short kapısı AKTİF: pozisyon yok + skor≤satış eşiği → SELL "
+                 "(spot etkilenmez; vadeli SHORT açar).")
+    else:
+        LOG.error("[32B.2] isim çakışması — sarmalayıcı bağlanmadı.")
+
+# ---- 32B.1 bağlama: 30.7 ölçümünü probe'a yönlendir ----
+_orig_cycle32b = TradingBotV2._cycle
+
+def _cycle32b(self):
+    try:
+        if (os.environ.get("DYNAMIC_STALE", "1").strip().lower()
+                not in ("0", "false", "no")):
+            if BTC32B.get("ts", 0.0) + 300.0 < time.time():
+                ap = _btc_atr_pct_probe32b(self.cfg.primary_timeframe)
+                BTC32B["ts"] = time.time()
+                BTC32B["atr_pct"] = ap
+                if _ok(ap):
+                    self.engine_max_age_backup = getattr(self, "engine_max_age_backup",
+                                                         ENGINE.max_age)
+                    ENGINE.max_age = 45.0 if ap > 4.0 else self.engine_max_age_backup
+    except Exception:
+        pass
+    _orig_cycle32b(self)
+
+BTC32B = {"ts": 0.0, "atr_pct": None}
+TradingBotV2._cycle = _cycle32b
+if "TradingBotV3" in dir():
+    TradingBotV3._cycle = _cycle32b
+LOG.info("[32B.1] Volatilite ölçümü cache-dışı probe'a geçti (cache kirliliği bitti).")
+
+print("[BÖLÜM 32B] Mantık yamaları AKTİF — BTC cache fix + short kapısı açık.")
 if __name__ == "__main__":
     main()
