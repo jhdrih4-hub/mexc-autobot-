@@ -5268,5 +5268,69 @@ LOG.info("[35] Periyodik state kaydı AKTİF (her %d döngüde spot+swap).",
 
 print("[BÖLÜM 35] TAMAM — Cancel anında bile en fazla %d döngülük durum kaybolur."
       % STATE_SAVE_EVERY)
+# ============================================================
+# BÖLÜM 36 — KAPATMA HİSTERESİSİ (anti-churn)
+# Sorun: AÇMA eşiği ≤−0.35, KAPAMA da aynı eşik → skor 1 tik
+# dönerse az açılan pozisyon anında kapanıyor (fee erimesi).
+# Fix: KAPATMA daha sert eşik ister (−0.35 −0.15 = −0.50) veya
+# minimum tutma süresi (15m = 1 mum) dolmadan sinyal-kapanışı yapılmaz.
+# SL/TP/trailing/zaman-stopu ETKİLENMEZ (risk çıkışları her zaman açık).
+# ============================================================
+print("[BÖLÜM 36] Kapatma hysteresisi yükleniyor...")
+
+CLOSE_SCORE_MARGIN = safe_float(os.environ.get("CLOSE_SCORE_MARGIN"), 0.15) or 0.15
+MIN_HOLD_SECONDS = safe_float(os.environ.get("MIN_HOLD_SECONDS"), 900.0) or 900.0
+
+# 36.1 Swap tarafı: sinyal-kapanışı gate'i
+_orig_swap_step36 = SwapEngineRunner.step
+
+def _wrap36_step(self, symbol, snap, signals, weights, regime, sent, prices_spot, ind=None):
+    pos = self.pf.positions.get(symbol)
+    if pos is not None:
+        held = time.time() - (pos.opened_at or time.time())
+        if held < MIN_HOLD_SECONDS:
+            # minimum süre dolmadı → sinyal-kapanışı bu döngüde atlanır
+            # (SL/TP/trailing check_stops YOLUNDAN geçer, buradan değil)
+            self._hold_until36 = getattr(self, "_hold_until36", {})
+            self._hold_until36[symbol] = (pos.opened_at or time.time()) + MIN_HOLD_SECONDS
+        else:
+            self._hold_until36 = getattr(self, "_hold_until36", {})
+            self._hold_until36.pop(symbol, None)
+    return _orig_swap_step36(self, symbol, snap, signals, weights, regime, sent,
+                             prices_spot, ind)
+
+SwapEngineRunner.step = _wrap36_step
+
+# 36.2 Karar eşiği: kapatma skoruna marj ekle (her iki motor için ortak decide)
+_orig_decide36 = DECISION.decide
+_decide_orig_name36 = getattr(_orig_decide36, "__name__", "?")
+
+def _decide36(symbol, snapshot, signals, weights, sentiment, has_position, regime):
+    d = _orig_decide36(symbol, snapshot, signals, weights, sentiment,
+                       has_position, regime)
+    try:
+        if has_position and d.action == "SELL":
+            # kapatma daha sert eşik ister
+            strict = CONFIG.sell_score_threshold - CLOSE_SCORE_MARGIN
+            if d.score > strict:
+                return Decision(ts=d.ts, symbol=d.symbol, action="HOLD",
+                                score=d.score, confidence=d.confidence,
+                                reasons=d.reasons + [
+                                    f"hysteresis: kapatma için skor≤{strict:.2f} gerekli"],
+                                regime=d.regime, data_ok=d.data_ok)
+    except Exception as e:
+        LOG.debug("[36] decide eki: %s", e)
+    return d
+
+DECISION.decide = _decide36
+if _decide36.__name__ != _decide_orig_name36:
+    LOG.info("[36.2] Kapatma hysteresisi AKTİF: SELL için skor≤%.2f (normal %.2f) gerekli.",
+             CONFIG.sell_score_threshold - CLOSE_SCORE_MARGIN,
+             CONFIG.sell_score_threshold)
+else:
+    LOG.error("[36.2] isim çakışması — hysteresis bağlanmadı.")
+
+print("[BÖLÜM 36] TAMAM — minimum tutma %.0f sn + kapatma eşiği −%.2f."
+      % (MIN_HOLD_SECONDS, CONFIG.sell_score_threshold - CLOSE_SCORE_MARGIN))
 if __name__ == "__main__":
     main()
