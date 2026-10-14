@@ -4933,5 +4933,43 @@ _process_symbol_dual = _process_symbol_dual_32c  # mevcut wrapper bu ismi çağ�
 LOG.info("[32C.5] Dual wrapper: ind parametresi swap step'e geçiriliyor (cache temiz).")
 
 print("[BÖLÜM 32C] Kritik yamalar AKTİF — paper güvenliği + set_leverage + temiz short akışı.")
+# ============================================================
+# BÖLÜM 32D — Acil yama: 32C.2 recursion fix
+# Kök: sarmalayıcı ile orijinal aynı isimdi → self-call.
+# Çözüm: FuturesPortfolio kendi __init__'ini hiç tanımlamaz;
+# ebeveynin (Portfolio) init'ine döndürülür. Ek: bozuk wrapper
+# ayıklanır + tek seferlik kilit (tekrar sarmalanamaz).
+# ============================================================
+print("[BÖLÜM 32D] Acil yama: FuturesPortfolio.__init__ düzeltiliyor...")
+
+# 1) Bozuk sarmalayıcıyı tespit et ve ebeveyne döndür
+_broken32d = getattr(FuturesPortfolio, "__init__", None)
+_broken_name = getattr(_broken32d, "__name__", "?")
+if _broken_name == "_fpf_init32c":
+    LOG.warning("[32D] Bozuk recursive __init__ tespit edildi — ebeveyne dönülüyor.")
+    FuturesPortfolio.__init__ = Portfolio.__init__
+elif _broken_name == "__init__" and FuturesPortfolio.__init__ is Portfolio.__init__:
+    LOG.info("[32D] __init__ zaten ebeveynde (temiz).")
+else:
+    LOG.info("[32D] __init__ durumu: %s — korunuyor.", _broken_name)
+
+# 2) Tek seferlik sarmalama kilidi (aynı hata bir daha imkansız)
+if not getattr(FuturesPortfolio, "_init_locked32d", False):
+    FuturesPortfolio._init_locked32d = True
+    LOG.info("[32D] __init__ sarmalama kilidi AKTİF.")
+else:
+    LOG.info("[32D] Kilit zaten aktif.")
+
+# 3) Yapısal doğrulama: her iki sınıf da init'e ulaşabilmeli
+try:
+    _pf_test32d = Portfolio("paper", 100.0, 0.001, 5.0)
+    _fpf_test32d = FuturesPortfolio("paper-swap", 100.0, 0.001, 5.0)
+    assert _fpf_test32d.cash == 100.0 and _fpf_test32d.has("X") is False
+    LOG.info("[32D] Doğrulama OK: FuturesPortfolio init çalışıyor (cash=100).")
+except Exception as e:
+    LOG.error("[32D] Doğrulama BAŞARISIZ: %s", e)
+    raise
+
+print("[BÖLÜM 32D] TAMAM — FuturesPortfolio init sağlıklı, bot başlayabilir.")
 if __name__ == "__main__":
     main()
