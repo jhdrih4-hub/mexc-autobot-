@@ -2964,7 +2964,7 @@ class MacroEngine:
             return "makro: kapalı"
         return f"makro skala={self.scalar:.2f} ({self.category}) F&G={self.data.get('fng')}"
 
-MACRO = MacroEngine(CONFIG)
+MACRO = MacroEngine(CONFIG.macro)
 
 if CONFIG.macro.enabled:
     _orig_pre_trade_macro = RISK.pre_trade_checks
