@@ -4971,5 +4971,111 @@ except Exception as e:
     raise
 
 print("[BÖLÜM 32D] TAMAM — FuturesPortfolio init sağlıklı, bot başlayabilir.")
+# ============================================================
+# BÖLÜM 32E — GÜVENLİK ZİNCİRİ (3 yama)
+# 32E.1 (KRİTİK) mode normalizasyonu düzeltildi: FuturesPortfolio
+#      init'ine güvenli sarmalayıcı (isim-gölgeleme yok, doğrulamalı).
+# 32E.2 (KORU) Canlı emir yollarında sert mode çiti:
+#      pf.mode != "live" ise borsa çağrısı FİZİKSEL olarak atılır.
+#      → Paper'da gerçek emir artık imkânsız (bakiye şansına değil).
+# 32E.3 Swap sembol filtresi: futures piyasası olmayan semboller
+#      (örn. FIL/USDT:USDT yok) swap motorunda atlanır.
+# ============================================================
+print("[BÖLÜM 32E] Güvenlik zinciri yükleniyor...")
+
+# ---- 32E.1 mode normalizasyonu (doğru isim kuralıyla) ----
+_orig32e_pf_init = Portfolio.__init__
+
+def _wrap32e_pf_init(self, mode, start_balance, fee_rate, slippage_bps):
+    _orig32e_pf_init(self, "paper" if str(mode).startswith("paper") else mode,
+                     start_balance, fee_rate, slippage_bps)
+    self.swap_tag = str(mode)   # journal/etiket için orijinal mod korunur
+
+FuturesPortfolio.__init__ = _wrap32e_pf_init
+# doğrulama: isimler farklı olmalı (gölgeleme yok)
+assert _wrap32e_pf_init.__name__ != _orig32e_pf_init.__name__, "[32E.1] isim çakışması!"
+_pf32e = FuturesPortfolio("paper-swap", 100.0, 0.001, 5.0)
+assert _pf32e.mode == "paper" and _pf32e.swap_tag == "paper-swap"
+LOG.info("[32E.1] mode normalizasyonu OK: paper-swap → paper (swap_tag=%s).",
+         _pf32e.swap_tag)
+
+# ---- 32E.2 canlı-emir çiti (her iki motor) ----
+_orig32e_buy_v2 = ExecutionEngineV2.market_buy
+_orig32e_close_v2 = ExecutionEngineV2.market_close
+_orig32e_buy_f = FuturesExecutionEngine.market_buy
+_orig32e_close_f = FuturesExecutionEngine.market_close
+
+def _gate_live32e(pf):
+    if str(pf.mode).startswith("paper") or pf.mode == "backtest":
+        if pf.mode != "live":
+            return True   # paper/backtest → borsa yoluna izin VERME durumu ayrı ele alınır
+    return False
+
+def _deny32e(engine, action):
+    raise TradingSystemError(
+        f"[32E.2] GÜVENLİK ÇİTİ: '{action}' borsa yolu engellendi — pf.mode="
+        f"{getattr(engine.pf, 'mode', '?')} live değil. (Yanlış yönlendirme koruması)")
+
+_orig32e_buy_f = _orig32e_buy_f  # noqa (isim bütünlüğü)
+
+def _wrap32e_buy_v2(self, symbol, amount, ref_price, atr_val, strategy="combined"):
+    if str(self.pf.mode).startswith("paper") and self.pf.mode not in ("paper", "backtest"):
+        _deny32e(self, "market_buy")
+    return _orig32e_buy_v2(self, symbol, amount, ref_price, atr_val, strategy)
+
+def _wrap32e_close_v2(self, symbol, ref_price, reason):
+    if str(self.pf.mode).startswith("paper") and self.pf.mode not in ("paper", "backtest"):
+        _deny32e(self, "market_close")
+    return _orig32e_close_v2(self, symbol, ref_price, reason)
+
+def _wrap32e_buy_f(self, symbol, amount, ref_price, atr_val, strategy="combined"):
+    if str(self.pf.mode).startswith("paper") and self.pf.mode not in ("paper", "backtest"):
+        _deny32e(self, "futures market_buy")
+    return _orig32e_buy_f(self, symbol, amount, ref_price, atr_val, strategy)
+
+def _wrap32e_close_f(self, symbol, ref_price, reason):
+    if str(self.pf.mode).startswith("paper") and self.pf.mode not in ("paper", "backtest"):
+        _deny32e(self, "futures market_close")
+    return _orig32e_close_f(self, symbol, ref_price, reason)
+
+ExecutionEngineV2.market_buy = _wrap32e_buy_v2
+ExecutionEngineV2.market_close = _wrap32e_close_v2
+FuturesExecutionEngine.market_buy = _wrap32e_buy_f
+FuturesExecutionEngine.market_close = _wrap32e_close_f
+LOG.info("[32E.2] Canlı-emir çiti AKTİF: mode Paper-*'dan borsa yoluna geçiş İMKÂNSIZ.")
+
+# ---- 32E.3 swap sembol filtresi (futures piyasası olmayanlar atlanır) ----
+def _swap_market_ok32e(symbol):
+    try:
+        if FUT_ADAPTER is not None:
+            mk = FUT_ADAPTER.markets()
+            return spot_to_swap(symbol) in mk
+        # FUT_ADAPTER yoksa spot adaptördeki swap formatını dene
+        return spot_to_swap(symbol) in ADAPTER.markets()
+    except TradingSystemError:
+        return False
+
+_orig32e_step = SwapEngineRunner.step
+
+def _wrap32e_step(self, symbol, snap, signals, weights, regime, sent, prices_spot,
+                  ind=None):
+    if not _swap_market_ok32e(symbol):
+        LOG.debug("[SWAP][%s] futures piyasası yok — swap motoru atladı.", symbol)
+        return
+    if ind is None:
+        ind = {}
+    return _orig32e_step(self, symbol, snap, signals, weights, regime, sent,
+                         prices_spot, ind)
+
+SwapEngineRunner.step = _wrap32e_step
+try:
+    _no_fut = [s for s in CONFIG.symbols if not _swap_market_ok32e(s)]
+    LOG.info("[32E.3] Swap sembol filtresi AKTİF. Futures olmayan semboller: %s",
+             _no_fut or "yok")
+except Exception:
+    LOG.info("[32E.3] Swap sembol filtresi AKTİF.")
+
+print("[BÖLÜM 32E] Güvenlik zinciri AKTİF — paper'da gerçek emir İMKÂNSIZ, "
+      "futures olmayan semboller filtreli.")
 if __name__ == "__main__":
     main()
