@@ -4173,5 +4173,70 @@ print("[BÖLÜM 29C] Swap risk izolasyonu AKTIF — kilit/limit hesapları swap 
 # ============================================================
 # NİHAİ BAŞLATMA (dosyanın EN SONU burası olmalı)
 # ============================================================
+# ============================================================
+# BÖLÜM 29D — DOĞRULAMA YAMALARI (append-only)
+# 29D.1 Hacim fallback: MEXC bazı sembollerde quoteVolume döndürmüyor
+#      (None) → yanlış "24s hacim düşük" uyarısı çıkıyordu.
+#      Artık OHLCV'den hesaplanıyor (96 x 15m kapalı mum ≈ 24 saat).
+# 29D.2 Zaman stopu + MFE/MAE vadeli motoruna taşındı (Bölüm 28 kapsamı).
+# ============================================================
+print("[BÖLÜM 29D] Doğrulama yamaları yükleniyor...")
+
+# ---- 29D.1 hacim fallback (cache'ten okur, ekstra API yükü yok) ----
+_orig_snapshot_29d = MarketDataEngine.snapshot
+
+def _snapshot_29d(self, symbol):
+    s = _orig_snapshot_29d(self, symbol)
+    if not s.get("quote_volume_24h"):
+        try:
+            dfv = self.get_ohlcv(symbol, self.cfg.primary_timeframe, limit=100, min_candles=96)
+            s["quote_volume_24h"] = float((dfv["volume"].tail(96) * dfv["close"].tail(96)).sum())
+        except TradingSystemError:
+            pass
+    return s
+
+MarketDataEngine.snapshot = _snapshot_29d
+
+# ---- 29D.2 zaman stopu + MFE/MAE (swap; short yönü farkındalıklı) ----
+_orig_fcheck_29d = FuturesExecutionEngine.check_stops
+
+def _fcheck_29d(self, symbol, price):
+    pos = self.pf.positions.get(symbol)
+    if pos is not None:
+        ctx = self.entry_ctx.setdefault(symbol, {})
+        entry = pos.entry_price or 0.0
+        if entry > 0:
+            chg = ((price / entry) - 1.0) * 100.0
+            if pos.side == "short":
+                chg = -chg
+            ctx["mfe"] = max(ctx.get("mfe", 0.0), chg)
+            ctx["mae"] = min(ctx.get("mae", 0.0), chg)
+            age_h = (time.time() - (pos.opened_at or time.time())) / 3600.0
+            if age_h > TIME_STOP_HOURS and chg < TIME_STOP_MIN_PCT:
+                LOG.info("[SWAP][%s] ZAMAN STOPU (%.0f saat, %+.2f%%) — sermaye döngüsü.",
+                         symbol, age_h, chg)
+                return self.market_close(symbol, price, "zaman_stopu")
+    return _orig_fcheck_29d(self, symbol, price)
+
+FuturesExecutionEngine.check_stops = _fcheck_29d
+
+_orig_fclose_29d = FuturesExecutionEngine.market_close
+
+def _fclose_29d(self, symbol, ref_price, reason):
+    ctx = self.entry_ctx.get(symbol) or {}
+    mfe, mae = ctx.get("mfe"), ctx.get("mae")
+    tr = _orig_fclose_29d(self, symbol, ref_price, reason)
+    if tr is not None and mfe is not None:
+        try:
+            uid = f"{tr.symbol}-{int(tr.opened_at)}-{int(tr.closed_at)}-{reason}"
+            self.db._exec("UPDATE trade_journal SET mfe=?, mae=? WHERE trade_uid=?",
+                          (mfe, mae, uid))
+        except Exception:
+            pass
+    return tr
+
+FuturesExecutionEngine.market_close = _fclose_29d
+
+print("[BÖLÜM 29D] AKTİF | hacim fallback + swap zaman stopu + swap MFE/MAE")
 if __name__ == "__main__":
     main()
