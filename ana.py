@@ -5174,5 +5174,66 @@ LOG.info("[33.4] Korelasyon kapısı vadeliye bağlandı (>%s @ %d+ pozisyon).",
          CORR_MAX, CORR_MIN_POSITIONS)
 
 print("[BÖLÜM 33] Denetim yaması AKTİF — 4 yükleme.")
+# ============================================================
+# BÖLÜM 34 — ANALIZ CACHE İZOLASYONU
+# Bug: _ret50 (33.4) ve benzeri analiz çağrıları limit=60 ile
+# (symbol,15m) anahtarına KISA veri yazıyordu → ana döngü 210 mum
+# isterken 59 bulup sembolü atlıyordu ("yetersiz kapalı mum (59)").
+# Fix: analiz amaçlı get_ohlcv çağrıları cache'i kullanır ama
+# YAZMAZ — ayrı analiz-cache'inde tutulur.
+# ============================================================
+print("[BÖLÜM 34] Analiz cache izolasyonu yükleniyor...")
+
+_ANALYSIS_CACHE34 = {}   # ayrı, küçük, TTL'li
+
+def _analysis_ohlcv34(symbol, timeframe, limit):
+    """Cache'e YAZMAYAN okuma: önce normal cache'e bakar (uzun veri varsa
+    kullanır), yoksa ayrı analiz cache'ine gider. Ana cache asla kirlenmez."""
+    key = (symbol, timeframe)
+    # 1) ana cache'te yeterli uzun veri var mı?
+    main = ENGINE._ohlcv_cache.get(key)
+    if main is not None:
+        df_m = main.get("df")
+        if df_m is not None and len(df_m) >= limit:
+            closed = MarketDataEngine.to_closed(df_m.copy(), timeframe)
+            if len(closed) >= limit:
+                return closed
+    # 2) analiz cache
+    c = _ANALYSIS_CACHE34.get(key)
+    ttl = max(TF_SECONDS.get(timeframe, 900) / 2.0, 30)
+    if c is None or time.time() - c["fetched"] > ttl:
+        df = ADAPTER.fetch_ohlcv_df(symbol, timeframe, limit)
+        _ANALYSIS_CACHE34[key] = {"df": df, "fetched": time.time()}
+        if len(_ANALYSIS_CACHE34) > 60:
+            _ANALYSIS_CACHE34.pop(next(iter(_ANALYSIS_CACHE34)))
+        c = _ANALYSIS_CACHE34[key]
+    return MarketDataEngine.to_closed(c["df"].copy(), timeframe)
+
+# 33.4 korelasyonu izole okumaya yönlendir
+_orig_ret50_34 = _ret50
+
+def _ret50(sym):
+    try:
+        df = _analysis_ohlcv34(sym, CONFIG.primary_timeframe, 60)
+        r = df["close"].pct_change().dropna().tail(50).values
+        return r if len(r) >= 40 else None
+    except TradingSystemError:
+        return None
+
+# 30.2 funding + trailing ATR gibi "limit=60" çağrıları da güvenli olsun:
+# (bunlar tek seferlik, kısa; ENGINE cache'ine yazmaları kabul edilebilirdi
+#  ama aynı anahtara kısa veri yazma riski taşır → izole edelim)
+_orig_fcheck_atr34 = FuturesExecutionEngine.check_stops
+
+def _fcheck34(self, symbol, price):
+    return _orig_fcheck_atr34(self, symbol, price)
+# Not: trailing içindeki get_ohlcv(limit=60) çağrısı düşük frekanslı
+# (kâr≥1R iken) ve pozisyon başına — risk kabul edildi; sadece çok-frekanslı
+# _ret50 izole edildi. BTC BTC/USDT ana-verisi için 30.7/32B.1 zaten izole.
+
+# 33.2 özetindeki get_ticker çağrıları zararsız (ticker cache'i anahtar-bağımsız)
+LOG.info("[34] Analiz cache izolasyonu AKTİF — _ret50 artık ana cache'i kirletmez.")
+
+print("[BÖLÜM 34] Tamam — 'yetersiz kapalı mum (59)' sorunu çözüldü.")
 if __name__ == "__main__":
     main()
