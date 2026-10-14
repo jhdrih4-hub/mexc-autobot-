@@ -3720,7 +3720,27 @@ def main():
     if mode == TradingMode.LIVE and not _confirm_live():
         print("İptal edildi.")
         return
+    if mode == TradingMode.LIVE and not _confirm_live():
+        print("İptal edildi.")
+        return
 
+    global SWAP_RUNNER
+    if CONFIG.futures.enabled and FUT_ADAPTER is not None:
+        spot_b = start_balance * SPOT_BUDGET_PCT / 100.0
+        swap_b = start_balance - spot_b
+        start_balance = spot_b
+        SWAP_RUNNER = SwapEngineRunner(CONFIG, DB)
+        SWAP_RUNNER.setup(swap_b)
+        SWAP_RUNNER.load_state()
+        print(f"[ÇİFT-MOTOR] SPOT bütçe={fmt_money(spot_b)} | SWAP bütçe={fmt_money(swap_b)} "
+              f"({CONFIG.futures.leverage}x)")
+    else:
+        print("[ÇİFT-MOTOR] Tek motor (spot) — swap kapalı.")
+
+    if CONFIG.futures.enabled:
+        portfolio = FuturesPortfolio(mode.value, start_balance,
+                                     CONFIG.paper_fee_rate, CONFIG.paper_slippage_bps)
+        ...
     if CONFIG.futures.enabled:
         portfolio = FuturesPortfolio(mode.value, start_balance,
                                      CONFIG.paper_fee_rate, CONFIG.paper_slippage_bps)
