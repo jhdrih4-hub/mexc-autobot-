@@ -1,0 +1,9 @@
+ccxt
+pandas
+numpy
+feedparser
+plotly
+requests
+scikit-learn
+matplotlib
+joblib
