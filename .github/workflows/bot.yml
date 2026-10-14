@@ -1,0 +1,79 @@
+# ============================================================
+#  MEXC TICARET BOTU — GITHUB ACTIONS WORKFLOW
+#  Dosya konumu: .github/workflows/bot.yml
+# ============================================================
+
+name: trading-bot
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */6 * * *"
+
+concurrency:
+  group: trading-bot
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Repoyu indir
+        uses: actions/checkout@v4
+
+      - name: Python 3.11 kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # DB + ML modelleri + loglar run'lar arasi korunur
+      - name: Durumu geri yukle (DB + ML modelleri)
+        uses: actions/cache@v4
+        with:
+          path: |
+            trading.db
+            trading.db-wal
+            trading.db-shm
+            system.log
+            models/
+          key: bot-durum-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            bot-durum-
+
+      - name: Bagimliliklari kur
+        run: pip install --quiet ccxt pandas numpy feedparser plotly requests scikit-learn matplotlib
+
+      - name: BOTU CALISTIR
+        run: python -u ana.py
+        env:
+          TRADING_MODE: ${{ secrets.TRADING_MODE }}
+          MEXC_API_KEY: ${{ secrets.MEXC_API_KEY }}
+          MEXC_SECRET: ${{ secrets.MEXC_SECRET }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          KILL_SWITCH: ${{ vars.KILL_SWITCH }}
+          MAX_RUNTIME_MINUTES: "330"
+
+      - name: Ozet rapor
+        if: always()
+        run: |
+          python - <<'EOF'
+          import sqlite3, os
+          if not os.path.exists("trading.db"):
+              print("[OZET] Veritabani yok."); raise SystemExit
+          c = sqlite3.connect("trading.db")
+          try:
+              n, pnl = c.execute("SELECT COUNT(*), ROUND(SUM(net_pnl),2) FROM trades").fetchone()
+              print(f"[OZET] Islem: {n} | Net PnL: {pnl} USDT")
+              j = c.execute("SELECT COUNT(*) FROM trade_journal").fetchone()[0]
+              print(f"[OZET] Journal kayitlari: {j}")
+              for r in c.execute("SELECT version,status FROM ml_models ORDER BY trained_at DESC LIMIT 2"):
+                  print("[ML]", r[0], r[1])
+          except Exception as e:
+              print(f"[OZET] {e}")
+          EOF
