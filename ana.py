@@ -3941,6 +3941,20 @@ if "TradingBotV3" in dir():
     TradingBotV3._process_symbol = _ps_wrapper
 
 print("[BÖLÜM 29] Paralel çift motor hazır (spot her zaman; swap TRADING_MARKET=swap ile).")
+_orig_shutdown29 = TradingBotV2._shutdown
+
+def _shutdown_dual(self):
+    if SWAP_RUNNER is not None:
+        try:
+            SWAP_RUNNER.save_state()
+            LOG.info("[SWAP-MOTOR] %s", SWAP_RUNNER.report_line())
+        except Exception:
+            pass
+    _orig_shutdown29(self)
+
+TradingBotV2._shutdown = _shutdown_dual
+if "TradingBotV3" in dir():
+    TradingBotV3._shutdown = _shutdown_dual
 if __name__ == "__main__":
     main()
 # ============================================================
