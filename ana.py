@@ -5235,5 +5235,38 @@ def _fcheck34(self, symbol, price):
 LOG.info("[34] Analiz cache izolasyonu AKTİF — _ret50 artık ana cache'i kirletmez.")
 
 print("[BÖLÜM 34] Tamam — 'yetersiz kapalı mum (59)' sorunu çözüldü.")
+# ============================================================
+# BÖLÜM 35 — PERİYODİK STATE KAYDI (restart recovery sertleştirme)
+# Sorun: Cancel workflow anlık öldürebilir → _shutdown'taki state
+# kaydı kaçabilir → swap pozisyonları kaybolmuştu (SOL re-open kanıtı).
+# Fix: her 5 döngüde (~10 dk) spot + swap state diske yazılır.
+# ============================================================
+print("[BÖLÜM 35] Periyodik state kaydı yükleniyor...")
+
+STATE_SAVE_EVERY = int(safe_float(os.environ.get("STATE_SAVE_EVERY"), 5) or 5)
+
+_orig_cycle35 = TradingBotV2._cycle
+
+def _cycle35(self):
+    _orig_cycle35(self)
+    if self.cycle % STATE_SAVE_EVERY == 0:
+        try:
+            self._save_paper_state()
+        except Exception as e:
+            LOG.warning("[35] spot state: %s", e)
+        try:
+            if SWAP_RUNNER is not None and SWAP_RUNNER.pf is not None:
+                SWAP_RUNNER.save_state()
+        except Exception as e:
+            LOG.warning("[35] swap state: %s", e)
+
+TradingBotV2._cycle = _cycle35
+if "TradingBotV3" in dir():
+    TradingBotV3._cycle = _cycle35
+LOG.info("[35] Periyodik state kaydı AKTİF (her %d döngüde spot+swap).",
+         STATE_SAVE_EVERY)
+
+print("[BÖLÜM 35] TAMAM — Cancel anında bile en fazla %d döngülük durum kaybolur."
+      % STATE_SAVE_EVERY)
 if __name__ == "__main__":
     main()
