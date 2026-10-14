@@ -3737,3 +3737,98 @@ def main():
 
 if __name__ == "__main__":
     main()
+# ============================================================
+# BÖLÜM 28 — VERİM PAKETİ
+# 28.1 Zaman stopu: X saatte kâr <%Y olan pozisyon kapatılır (sermaye döngüsü)
+# 28.2 MFE/MAE: her işlemin en iyi/en kötü anı journal'a yazılır (ML besini)
+# 28.3 Korelasyon kapısı: açık pozisyonlarla ort. korelasyon yüksekse yeni giriş ENGELLENİR
+# Kapsam: SPOT motoru (futures motoruna sonradan taşınacak)
+# ============================================================
+print("[BÖLÜM 28] Verim paketi yükleniyor...")
+
+TIME_STOP_HOURS = safe_float(os.environ.get("TIME_STOP_HOURS"), 48.0) or 48.0
+TIME_STOP_MIN_PCT = safe_float(os.environ.get("TIME_STOP_MIN_PCT"), 0.3)
+CORR_MAX = safe_float(os.environ.get("CORR_MAX"), 0.85)
+CORR_MIN_POSITIONS = int(safe_float(os.environ.get("CORR_MIN_POSITIONS"), 3) or 3)
+
+# --- 28.1 journal'a mfe/mae kolonları (zaten varsa sessizce geç) ---
+for _col in ("mfe", "mae"):
+    try:
+        DB._exec(f"ALTER TABLE trade_journal ADD COLUMN {_col} REAL")
+    except sqlite3.OperationalError:
+        pass
+
+# --- 28.2 Zaman stopu + MFE/MAE takibi (sarmalayıcı — mevcut kod değişmedi) ---
+_orig_cs28 = ExecutionEngineV2.check_stops
+
+def _cs28(self, symbol, price):
+    pos = self.pf.positions.get(symbol)
+    if pos is not None:
+        ctx = self.entry_ctx.setdefault(symbol, {})
+        entry = pos.entry_price or 0.0
+        if entry > 0:
+            chg = ((price / entry) - 1.0) * 100.0
+            ctx["mfe"] = max(ctx.get("mfe", 0.0), chg)
+            ctx["mae"] = min(ctx.get("mae", 0.0), chg)
+            age_h = (time.time() - (pos.opened_at or time.time())) / 3600.0
+            if age_h > TIME_STOP_HOURS and chg < TIME_STOP_MIN_PCT:
+                LOG.info("[%s] ZAMAN STOPU (%.0f saat, %+.2f%%) — sermaye döngüsü.",
+                         symbol, age_h, chg)
+                return self.market_close(symbol, price, "zaman_stopu")
+    return _orig_cs28(self, symbol, price)
+
+ExecutionEngineV2.check_stops = _cs28
+
+_orig_mc28 = ExecutionEngineV2.market_close
+
+def _mc28(self, symbol, ref_price, reason):
+    ctx = self.entry_ctx.get(symbol) or {}
+    mfe, mae = ctx.get("mfe"), ctx.get("mae")
+    tr = _orig_mc28(self, symbol, ref_price, reason)
+    if tr is not None and mfe is not None:
+        try:
+            uid = f"{tr.symbol}-{int(tr.opened_at)}-{int(tr.closed_at)}-{reason}"
+            self.db._exec("UPDATE trade_journal SET mfe=?, mae=? WHERE trade_uid=?",
+                          (mfe, mae, uid))
+        except Exception:
+            pass
+    return tr
+
+ExecutionEngineV2.market_close = _mc28
+
+# --- 28.3 Korelasyon kapısı ---
+def _ret50(sym):
+    try:
+        df = ENGINE.get_ohlcv(sym, CONFIG.primary_timeframe, limit=60, min_candles=55)
+        r = df["close"].pct_change().dropna().tail(50).values
+        return r if len(r) >= 40 else None
+    except TradingSystemError:
+        return None
+
+_prev_pre28 = RISK.pre_trade_checks
+
+def _pre28(symbol, snapshot, ind, portfolio, prices):
+    ok, reasons = _prev_pre28(symbol, snapshot, ind, portfolio, prices)
+    if ok and len(portfolio.positions) >= CORR_MIN_POSITIONS:
+        rc = _ret50(symbol)
+        if rc is not None:
+            cors = []
+            for s in list(portfolio.positions):
+                rp = _ret50(s)
+                if rp is None or len(rp) != len(rc):
+                    continue
+                if np.std(rc) < 1e-12 or np.std(rp) < 1e-12:
+                    continue
+                c = float(np.corrcoef(rc, rp)[0, 1])
+                if math.isfinite(c):
+                    cors.append(c)
+            if cors:
+                avg = sum(cors) / len(cors)
+                if avg > CORR_MAX:
+                    reasons.append(f"korelasyon kapısı: ort {avg:.2f}>{CORR_MAX} — portföy tek bahis oluyor")
+                    ok = False
+    return ok, reasons
+
+RISK.pre_trade_checks = _pre28
+print(f"[BÖLÜM 28] AKTİF | zaman stopu: >{TIME_STOP_HOURS}sa & kâr<{TIME_STOP_MIN_PCT}% | "
+      f"korelasyon: >{CORR_MAX} @ {CORR_MIN_POSITIONS}+ pozisyon")
