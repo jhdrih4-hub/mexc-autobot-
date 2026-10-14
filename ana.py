@@ -3976,9 +3976,17 @@ def _swap_step_29b(self, symbol, snap, signals, weights, regime, sent, prices_sp
         except TradingSystemError:
             ind_g = {}
         try:
-            okg, whyg = RISK.pre_trade_checks(symbol, snap, ind_g,
+                        okg, whyg = RISK.pre_trade_checks(symbol, snap, ind_g,
                                               _SwapGatePf(self.pf),
                                               {symbol: snap.get("last") or 0.0})
+            if not okg:
+                soft = [w for w in whyg
+                        if "hacim" not in w and "1h trend" not in w]
+                if soft:
+                    LOG.info("[SWAP][%s] giriş engellendi: %s", symbol, ", ".join(soft))
+                    return
+                LOG.info("[SWAP][%s] yumuşak engel geçildi (hacim/trend notu): %s",
+                         symbol, ", ".join(whyg))
             if not okg:
                 LOG.info("[SWAP][%s] giriş engellendi: %s", symbol, ", ".join(whyg))
                 return
