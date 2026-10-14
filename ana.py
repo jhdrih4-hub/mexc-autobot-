@@ -3120,3 +3120,621 @@ def main():
 
 if __name__ == "__main__":
     main()
+# ============================================================
+# BÖLÜM 27 — FUTURES (SWAP) MOTORU: KALDIRAÇLI LONG + SHORT
+# Mod seçimi: TRADING_MARKET=spot (varsayılan) | TRADING_MARKET=swap
+# Sert kurallar: max kaldıraç 3x, izole marjin, pozisyon riski x0.5,
+# likidasyon koruması, reduceOnly kapanış. Paper'da tam simülasyon.
+# ============================================================
+print("[BÖLÜM 27] Futures/Short motoru yükleniyor...")
+
+@dataclass
+class FuturesConfig:
+    enabled: bool = False
+    leverage: int = 3
+    max_leverage: int = 3
+    risk_scale: float = 0.5          # pozisyon riski %1 -> %0.5
+    funding_note: str = "live'da funding cost journal'a yazilir"
+
+CONFIG.futures = FuturesConfig()
+if (os.environ.get("TRADING_MARKET") or "spot").strip().lower() == "swap":
+    CONFIG.futures.enabled = True
+if os.environ.get("FUTURES_LEVERAGE"):
+    try:
+        CONFIG.futures.leverage = int(os.environ["FUTURES_LEVERAGE"])
+    except ValueError:
+        pass
+CONFIG.futures.leverage = max(1, min(CONFIG.futures.leverage, CONFIG.futures.max_leverage))
+
+def spot_to_swap(symbol: str) -> str:
+    """BTC/USDT -> BTC/USDT:USDT (MEXC swap sembol formatı)."""
+    return symbol if ":" in symbol else symbol + ":USDT"
+
+@dataclass
+class FuturesPosition(Position):
+    leverage: float = 1.0
+
+class FuturesPortfolio(Portfolio):
+    """Swap modeli (paper sim): cash açılışta düşülmez, yalnız fee kesilir.
+    equity = cash + unrealized(long+short). Short PnL = (entry - price) * amount."""
+    def unrealized(self, prices: dict) -> float:
+        tot = 0.0
+        for s, p in self.positions.items():
+            cur = prices.get(s, p.entry_price)
+            if p.side == "short":
+                tot += (p.entry_price - cur) * p.amount
+            else:
+                tot += (cur - p.entry_price) * p.amount
+        return tot
+
+    def equity(self, prices: dict) -> float:
+        return self.cash + self.unrealized(prices)
+
+    def open_short(self, symbol, amount, price, fee, sl, tp, strategy, ts, lev):
+        self.cash -= fee
+        pos = FuturesPosition(symbol=symbol, side="short", amount=amount,
+                              entry_price=price, stop_loss=sl, take_profit=tp,
+                              opened_at=ts, strategy=strategy, fees_paid=fee,
+                              leverage=lev)
+        self.positions[symbol] = pos
+        return pos
+
+    def close_futures(self, symbol, price, exit_fee, reason, ts=None):
+        pos = self.positions.get(symbol)
+        if not pos:
+            return None
+        if pos.side == "short":
+            gross = (pos.entry_price - price) * pos.amount
+        else:
+            gross = (price - pos.entry_price) * pos.amount
+        total_fees = pos.fees_paid + exit_fee
+        net = gross - total_fees
+        self.cash += gross - exit_fee
+        self.realized += net
+        self.fees += total_fees
+        tr = TradeRecord(opened_at=pos.opened_at, closed_at=ts or time.time(),
+                         mode=self.mode, exchange=self.exchange, symbol=symbol,
+                         side=pos.side, amount=pos.amount, entry_price=pos.entry_price,
+                         exit_price=price, gross_pnl=gross, fees=total_fees,
+                         net_pnl=net, strategy=pos.strategy, close_reason=reason)
+        self.positions.pop(symbol, None)
+        return tr
+
+class FuturesExecutionEngine(ExecutionEngineV2):
+    """Swap emir motoru. Live'da reduceOnly + set_leverage kullanır.
+    Paper'da tam simülasyon (slippage + fee + likidasyon koruması)."""
+
+    def _open_common(self, symbol, amount, ref_price, atr_val, side, strategy):
+        pf = self.pf
+        lev = CONFIG.futures.leverage
+        if pf.mode in ("paper", "backtest"):
+            slip = pf.slippage_bps / 10000.0
+            px = ref_price * (1 + slip) if side == "long" else ref_price * (1 - slip)
+            notional = amount * px
+            fee = notional * pf.fee_rate
+            margin = notional / lev
+            if margin + fee > pf.cash:
+                raise TradeBlockedError(f"marjin yetersiz ({fmt_money(pf.cash)})")
+            sl, tp = compute_sl_tp(self.cfg.risk, px, atr_val)
+            if side == "long":
+                pos = pf.open_position(symbol, amount, px, fee, sl, tp, strategy, time.time())
+                pos.leverage = lev
+            else:
+                pos = pf.open_short(symbol, amount, px, fee, sl, tp, strategy, time.time(), lev)
+            self.db.upsert_order(OrderRecord(
+                order_id=f"swap-{time.time():.3f}-{symbol.replace('/', '')}",
+                ts=time.time(), mode=pf.mode, exchange="mexc-swap", symbol=symbol,
+                side=("buy" if side == "long" else "sell"), type="market",
+                amount=amount, price=px, status=OrderStatus.FILLED.value,
+                filled=amount, avg_fill_price=px, fee_cost=fee, strategy=strategy))
+            return pos
+        # ---- LIVE swap yolu ----
+        cons = self.adapter.order_constraints(spot_to_swap(symbol))
+        min_cost = max(cons["cost_min"], self.cfg.risk.min_order_quote_usdt)
+        if amount * ref_price < min_cost:
+            raise TradeBlockedError(f"tutar min altı ({amount * ref_price:.2f})")
+        amount = self.adapter.round_amount(spot_to_swap(symbol), amount)
+        try:
+            self.adapter.set_leverage(spot_to_swap(symbol), lev)
+        except TradingSystemError as e:
+            LOG.warning("[%s] kaldıraç set edilemedi (devam): %s", symbol, e)
+        reduce_only = False
+        order_side = "buy" if side == "long" else "sell"
+        rec = self.adapter.create_order(spot_to_swap(symbol), order_side, "market",
+                                        amount, client_tag="bot",
+                                        params={"reduceOnly": reduce_only})
+        self.db.upsert_order(rec)
+        filled, avg, fee = self._await_fill(rec)
+        if not filled or not avg:
+            raise TradeBlockedError(f"swap emri dolmadı (id={rec.order_id})")
+        sl, tp = compute_sl_tp(self.cfg.risk, avg, atr_val)
+        if side == "long":
+            pos = pf.open_position(symbol, filled, avg, fee, sl, tp, strategy, time.time())
+            pos.leverage = lev
+        else:
+            pos = pf.open_short(symbol, filled, avg, fee, sl, tp, strategy, time.time(), lev)
+        return pos
+
+    def market_buy(self, symbol, amount, ref_price, atr_val, strategy="combined"):
+        return self._open_common(symbol, amount, ref_price, atr_val, "long", strategy)
+
+    def market_sell_short(self, symbol, amount, ref_price, atr_val, strategy="combined"):
+        return self._open_common(symbol, amount, ref_price, atr_val, "short", strategy)
+
+    def _risk_dist(self, symbol, pos):
+        sl0 = (self.entry_ctx.get(symbol) or {}).get("sl_initial") or pos.stop_loss
+        if pos.side == "short" and sl0 and sl0 > pos.entry_price:
+            return sl0 - pos.entry_price
+        if sl0 and sl0 < pos.entry_price:
+            return pos.entry_price - sl0
+        return pos.entry_price * self.cfg.risk.default_stop_loss_pct / 100.0
+
+    def market_close(self, symbol, ref_price, reason):
+        pf = self.pf
+        pos = pf.positions.get(symbol)
+        if not pos:
+            return None
+        if pf.mode in ("paper", "backtest"):
+            slip = pf.slippage_bps / 10000.0
+            px = ref_price * (1 - slip) if pos.side == "long" else ref_price * (1 + slip)
+            fee = pos.amount * px * pf.fee_rate
+            tr = pf.close_futures(symbol, px, fee, reason, time.time())
+            if tr:
+                self.db.save_trade(tr)
+            return tr
+        close_side = "sell" if pos.side == "long" else "buy"   # reduceOnly kapanış
+        rec = self.adapter.create_order(spot_to_swap(symbol), close_side, "market",
+                                        pos.amount, client_tag="close",
+                                        params={"reduceOnly": True})
+        self.db.upsert_order(rec)
+        filled, avg, fee = self._await_fill(rec)
+        if not filled or not avg:
+            raise TradeBlockedError(f"swap kapanış emri dolmadı (id={rec.order_id})")
+        tr = pf.close_futures(symbol, avg, fee or 0.0, reason, time.time())
+        if tr:
+            self.db.save_trade(tr)
+        return tr
+
+    def check_stops(self, symbol, price):
+        pos = self.pf.positions.get(symbol)
+        if not pos:
+            return None
+        # ---- likidasyon koruması (izole, ~%100/lev aleyhe) ----
+        lev = getattr(pos, "leverage", 1.0) or 1.0
+        liq_move = (1.0 / lev) * 0.7     # %70 likidasyon mesafesi = acil kapanış
+        if pos.side == "long" and price <= pos.entry_price * (1 - liq_move):
+            LOG.warning("[%s] LİKİDASYON KORUMASI tetiklendi!", symbol)
+            return self.market_close(symbol, price, "likidasyon_koruma")
+        if pos.side == "short" and price >= pos.entry_price * (1 + liq_move):
+            LOG.warning("[%s] LİKİDASYON KORUMASI tetiklendi!", symbol)
+            return self.market_close(symbol, price, "likidasyon_koruma")
+        # ---- trailing / break-even (mevcut V2 mantığı, yön-farkındalıklı) ----
+        r = self.cfg.risk
+        risk_dist = self._risk_dist(symbol, pos)
+        if (r.use_trailing_stop or r.use_break_even) and risk_dist > 0:
+            profit = (price - pos.entry_price) if pos.side == "long" else (pos.entry_price - price)
+            if r.use_break_even and profit >= r.break_even_trigger_rr * risk_dist:
+                buf = pos.entry_price * (r.break_even_buffer_pct / 100.0)
+                if pos.side == "long":
+                    be = pos.entry_price + buf
+                    if be > (pos.stop_loss or 0.0):
+                        pos.stop_loss = be
+                        LOG.info("[%s] Break-even SL → %s", symbol, fmt_money(be))
+                else:
+                    be = pos.entry_price - buf
+                    if pos.stop_loss is None or be < pos.stop_loss:
+                        pos.stop_loss = be
+                        LOG.info("[%s] Break-even SL (short) → %s", symbol, fmt_money(be))
+            if r.use_trailing_stop and profit >= r.trailing_activate_rr * risk_dist:
+                atr_val = None
+                try:
+                    df = ENGINE.get_ohlcv(symbol, self.cfg.primary_timeframe, limit=60)
+                    atr_val = safe_float(atr(df).iloc[-1])
+                except TradingSystemError:
+                    atr_val = None
+                if atr_val and atr_val > 0:
+                    if pos.side == "long":
+                        new_sl = price - r.trailing_atr_mult * atr_val
+                        if new_sl > (pos.stop_loss or 0.0):
+                            pos.stop_loss = new_sl
+                            LOG.info("[%s] Trailing SL → %s", symbol, fmt_money(new_sl))
+                    else:
+                        new_sl = price + r.trailing_atr_mult * atr_val
+                        if pos.stop_loss is None or new_sl < pos.stop_loss:
+                            pos.stop_loss = new_sl
+                            LOG.info("[%s] Trailing SL (short) → %s", symbol, fmt_money(new_sl))
+        # ---- SL/TP kontrolü (yön-farkındalıklı) ----
+        if pos.side == "short":
+            if pos.stop_loss and price >= pos.stop_loss:
+                return self.market_close(symbol, pos.stop_loss if self.pf.mode != "live" else price, "stop_loss")
+            if pos.take_profit and price <= pos.take_profit:
+                return self.market_close(symbol, pos.take_profit if self.pf.mode != "live" else price, "take_profit")
+            return None
+        return super().check_stops(symbol, price)
+
+if CONFIG.futures.enabled:
+    try:
+        FUT_ADAPTER = CcxtAdapter(CONFIG.exchange_id, "swap")
+        FUT_ADAPTER.load_markets()
+        print(f"-> MEXC SWAP bağlandı. {len(FUT_ADAPTER.markets())} futures piyasası yüklü.")
+    except TradingSystemError as e:
+        CONFIG.futures.enabled = False
+        LOG.error("[BÖLÜM 27] Swap adaptörü kurulamadı — SPOT modda devam: %s", e)
+else:
+    FUT_ADAPTER = None
+    print("[BÖLÜM 27] Futures KAPALI (TRADING_MARKET=spot) — kaldıraçsız long mod.")
+
+# ============================================================
+# BÖLÜM 27B — V3 BAĞLANTI: SHORT + KALDIRAÇ (5A düzeltmeleri dahil)
+# ============================================================
+print("[BÖLÜM 27B] V3 bağlantısı yükleniyor...")
+
+# ---- 27B.1 FuturesPortfolio: long marjin modeli (5A düzeltmesi) ----
+def _fut_open_long(self, symbol, amount, price, fee, sl, tp, strategy, ts, lev):
+    self.cash -= fee   # yalnız fee düşülür; teminat kapanışta iade modeli
+    pos = FuturesPosition(symbol=symbol, side="long", amount=amount,
+                          entry_price=price, stop_loss=sl, take_profit=tp,
+                          opened_at=ts, strategy=strategy, fees_paid=fee,
+                          leverage=lev)
+    self.positions[symbol] = pos
+    return pos
+FuturesPortfolio.open_long = _fut_open_long
+
+# ---- 27B.2 _open_common (düzeltilmiş: short SL/TP yönü + entry_ctx + TG) ----
+def _fut_open_common(self, symbol, amount, ref_price, atr_val, side, strategy):
+    pf = self.pf
+    lev = CONFIG.futures.leverage
+    if pf.mode in ("paper", "backtest"):
+        slip = pf.slippage_bps / 10000.0
+        px = ref_price * (1 + slip) if side == "long" else ref_price * (1 - slip)
+        notional = amount * px
+        fee = notional * pf.fee_rate
+        margin = notional / lev
+        if margin + fee > pf.cash:
+            raise TradeBlockedError(f"marjin yetersiz ({fmt_money(pf.cash)})")
+        if side == "long":
+            sl, tp = compute_sl_tp(self.cfg.risk, px, atr_val)
+        else:
+            a = atr_val
+            if _ok(a) and a > 0:
+                sl = px + self.cfg.risk.atr_stop_multiplier * a
+                tp = px - self.cfg.risk.atr_target_multiplier * a
+            else:
+                sl = px * (1 + self.cfg.risk.default_stop_loss_pct / 100.0)
+                tp = px * (1 - self.cfg.risk.default_take_profit_pct / 100.0)
+            if sl <= px: sl = px * (1 + self.cfg.risk.default_stop_loss_pct / 100.0)
+            if tp >= px: tp = px * (1 - self.cfg.risk.default_take_profit_pct / 100.0)
+        if side == "long":
+            pos = pf.open_long(symbol, amount, px, fee, sl, tp, strategy, time.time(), lev)
+        else:
+            pos = pf.open_short(symbol, amount, px, fee, sl, tp, strategy, time.time(), lev)
+        self.db.upsert_order(OrderRecord(
+            order_id=f"swap-{time.time():.3f}-{symbol.replace('/', '')}",
+            ts=time.time(), mode=pf.mode, exchange="mexc-swap", symbol=symbol,
+            side=("buy" if side == "long" else "sell"), type="market",
+            amount=amount, price=px, status=OrderStatus.FILLED.value,
+            filled=amount, avg_fill_price=px, fee_cost=fee, strategy=strategy))
+        return pos
+    cons = self.adapter.order_constraints(spot_to_swap(symbol))
+    min_cost = max(cons["cost_min"], self.cfg.risk.min_order_quote_usdt)
+    if amount * ref_price < min_cost:
+        raise TradeBlockedError(f"tutar min altı ({amount * ref_price:.2f})")
+    amount = self.adapter.round_amount(spot_to_swap(symbol), amount)
+    try:
+        self.adapter.set_leverage(spot_to_swap(symbol), lev)
+    except TradingSystemError as e:
+        LOG.warning("[%s] kaldıraç set edilemedi (devam): %s", symbol, e)
+    order_side = "buy" if side == "long" else "sell"
+    rec = self.adapter.create_order(spot_to_swap(symbol), order_side, "market",
+                                    amount, client_tag="bot")
+    self.db.upsert_order(rec)
+    filled, avg, fee = self._await_fill(rec)
+    if not filled or not avg:
+        raise TradeBlockedError(f"swap emri dolmadı (id={rec.order_id})")
+    if side == "long":
+        sl, tp = compute_sl_tp(self.cfg.risk, avg, atr_val)
+        pos = pf.open_long(symbol, filled, avg, fee, sl, tp, strategy, time.time(), lev)
+    else:
+        a = atr_val
+        if _ok(a) and a > 0:
+            sl = avg + self.cfg.risk.atr_stop_multiplier * a
+            tp = avg - self.cfg.risk.atr_target_multiplier * a
+        else:
+            sl = avg * (1 + self.cfg.risk.default_stop_loss_pct / 100.0)
+            tp = avg * (1 - self.cfg.risk.default_take_profit_pct / 100.0)
+        pos = pf.open_short(symbol, filled, avg, fee, sl, tp, strategy, time.time(), lev)
+    return pos
+FuturesExecutionEngine._open_common = _fut_open_common
+
+def _fut_market_buy(self, symbol, amount, ref_price, atr_val, strategy="combined"):
+    equity_before = self.pf.cash
+    pos = self._open_common(symbol, amount, ref_price, atr_val, "long", strategy)
+    if pos is None:
+        return None
+    self.entry_ctx[symbol] = {"sl_initial": pos.stop_loss, "entry_ts": pos.opened_at,
+                              "features": json.dumps(getattr(RISK, "last_features", {}).get(symbol) or {}),
+                              "regime": getattr(RISK, "last_regime", {}).get(symbol, "unknown"),
+                              "score": getattr(DECISION, "last_scores", {}).get(symbol),
+                              "equity_before": equity_before}
+    try:
+        df = ENGINE.get_ohlcv(symbol, self.cfg.primary_timeframe, limit=3)
+        RISK._last_entry_candle[symbol] = df["ts"].iloc[-1]
+    except TradingSystemError:
+        pass
+    RISK._last_entry_wall[symbol] = time.time()
+    TG.send(f"[SWAP-LONG] {symbol} {CONFIG.futures.leverage}x qty={pos.amount:.8f} "
+            f"@ {fmt_money(pos.entry_price)} SL={fmt_money(pos.stop_loss)} "
+            f"TP={fmt_money(pos.take_profit)}", "order")
+    return pos
+FuturesExecutionEngine.market_buy = _fut_market_buy
+
+def _fut_market_close(self, symbol, ref_price, reason):
+    pf = self.pf
+    pos = pf.positions.get(symbol)
+    if not pos:
+        return None
+    sl_final = pos.stop_loss
+    ctx = self.entry_ctx.pop(symbol, None)
+    if pf.mode in ("paper", "backtest"):
+        slip = pf.slippage_bps / 10000.0
+        px = ref_price * (1 - slip) if pos.side == "long" else ref_price * (1 + slip)
+        fee = pos.amount * px * pf.fee_rate
+        tr = pf.close_futures(symbol, px, fee, reason, time.time())
+        if tr:
+            self.db.save_trade(tr)
+    else:
+        close_side = "sell" if pos.side == "long" else "buy"
+        rec = self.adapter.create_order(spot_to_swap(symbol), close_side, "market",
+                                        pos.amount, client_tag="close",
+                                        params={"reduceOnly": True})
+        self.db.upsert_order(rec)
+        filled, avg, fee = self._await_fill(rec)
+        if not filled or not avg:
+            raise TradeBlockedError(f"swap kapanış emri dolmadı (id={rec.order_id})")
+        tr = pf.close_futures(symbol, avg, fee or 0.0, reason, time.time())
+        if tr:
+            self.db.save_trade(tr)
+    if tr is None:
+        return None
+    TG.send(f"[SWAP-KAPANIŞ] {symbol} {reason} | net={fmt_money(tr.net_pnl)} USDT", "trade")
+    try:
+        uid = f"{tr.symbol}-{int(tr.opened_at)}-{int(tr.closed_at)}-{reason}"
+        equity_after = self.pf.cash + self.pf.unrealized({})
+        slip_bps = abs(tr.exit_price - ref_price) / max(ref_price, 1e-12) * 10000.0 if ref_price else None
+        cols = ("trade_uid,mode,exchange,symbol,market_type,strategy,strategy_version,"
+                "buy_order_id,sell_order_id,side,amount,entry_price,exit_price,"
+                "sl_initial,sl_final,tp,entry_ts,exit_ts,duration_s,exit_reason,"
+                "gross_pnl,fees,net_pnl,slippage_bps,funding_cost,features,regime,"
+                "confidence,equity_before,equity_after,simulated,created_at")
+        vals = ",".join(["?"] * 32)
+        self.db._exec(f"INSERT OR IGNORE INTO trade_journal({cols}) VALUES({vals})",
+            (uid, tr.mode, "mexc-swap", tr.symbol, "swap", tr.strategy, "v3",
+             (ctx or {}).get("buy_order_id"),
+             last_order_id(self.db, symbol) if pf.mode == "live" else f"paper-{tr.closed_at:.0f}",
+             tr.side, tr.amount, tr.entry_price, tr.exit_price,
+             (ctx or {}).get("sl_initial"), sl_final, None,
+             tr.opened_at, tr.closed_at, tr.closed_at - tr.opened_at, reason,
+             tr.gross_pnl, tr.fees, tr.net_pnl, slip_bps, 0.0,
+             (ctx or {}).get("features"), (ctx or {}).get("regime"),
+             (ctx or {}).get("score"), (ctx or {}).get("equity_before"), equity_after,
+             1 if pf.mode != "live" else 0, time.time()))
+    except Exception as e:
+        LOG.warning("[JOURNAL-swap] yazılamadı: %s", e)
+    return tr
+FuturesExecutionEngine.market_close = _fut_market_close
+
+# ---- 27B.3 TradingBotV3: SELL sinyali → SHORT açılış (futures modda) ----
+class TradingBotV3(TradingBotV2):
+    def _save_paper_state(self):
+        if self.pf.mode != "paper":
+            return
+        data = {"cash": self.pf.cash, "start": self.pf.start_balance,
+                "positions": {s: {"amount": p.amount, "entry": p.entry_price,
+                                  "sl": p.stop_loss, "tp": p.take_profit,
+                                  "opened_at": p.opened_at, "strategy": p.strategy,
+                                  "side": p.side, "leverage": getattr(p, "leverage", 1.0)}
+                              for s, p in self.pf.positions.items()}}
+        try:
+            DB.set_meta("paper_state", json.dumps(data))
+        except Exception as e:
+            LOG.warning("[PAPER] durum kaydedilemedi: %s", e)
+
+    def _load_paper_state(self):
+        if self.pf.mode != "paper":
+            return
+        v = DB.get_meta("paper_state")
+        if not v:
+            return
+        try:
+            data = json.loads(v)
+            self.pf.cash = float(data.get("cash", self.pf.cash))
+            self.pf.start_balance = float(data.get("start", self.pf.start_balance))
+            for s, p in data.get("positions", {}).items():
+                side = p.get("side", "long")
+                if side == "short" or CONFIG.futures.enabled:
+                    pos = FuturesPosition(symbol=s, side=side,
+                                          amount=float(p["amount"]),
+                                          entry_price=float(p["entry"]),
+                                          stop_loss=safe_float(p.get("sl")),
+                                          take_profit=safe_float(p.get("tp")),
+                                          opened_at=float(p.get("opened_at", 0)),
+                                          strategy=str(p.get("strategy", "")),
+                                          leverage=float(p.get("leverage", 1.0)))
+                else:
+                    pos = Position(symbol=s, side="long", amount=float(p["amount"]),
+                                   entry_price=float(p["entry"]),
+                                   stop_loss=safe_float(p.get("sl")),
+                                   take_profit=safe_float(p.get("tp")),
+                                   opened_at=float(p.get("opened_at", 0)),
+                                   strategy=str(p.get("strategy", "")))
+                self.pf.positions[s] = pos
+            LOG.info("[PAPER] Önceki oturum yüklendi: cash=%s pozisyon=%d",
+                     fmt_money(self.pf.cash), len(self.pf.positions))
+        except Exception as e:
+            LOG.warning("[PAPER] durum yüklenemedi: %s", e)
+
+    def _process_symbol(self, symbol, prices):
+        snap = ENGINE.snapshot(symbol)
+        prices[symbol] = snap["last"]
+        df = ENGINE.get_ohlcv(symbol, self.cfg.primary_timeframe, min_candles=210)
+        try:
+            dfh = ENGINE.get_ohlcv(symbol, self.cfg.higher_timeframe, min_candles=210)
+        except TradingSystemError:
+            dfh = None
+        signals, ind = STRATEGIES.compute_all(symbol, df, dfh)
+        for s in signals:
+            try:
+                DB.save_signal(s)
+            except Exception:
+                pass
+        regime = REGIME.classify(df, ind)
+        weights = REGIME.adjust_weights(self.cfg.strategy_weights, regime)
+        sent = NEWS.sentiment_for(symbol)
+        if self.pf.has(symbol):
+            tr = self.execution.check_stops(symbol, snap["last"])
+            if tr:
+                LOG.info("[%s] POZİSYON KAPANDI (%s) net=%s",
+                         symbol, tr.close_reason, fmt_money(tr.net_pnl))
+                if tr.close_reason == "stop_loss":
+                    RISK.register_stop_hit(symbol)
+        dec = DECISION.decide(symbol, snap, signals, weights, sent,
+                              self.pf.has(symbol), regime)
+        try:
+            DB.save_decision(dec)
+        except Exception:
+            pass
+        LOG.info("[%s] %s skor=%+.2f rejim=%s haber=%+.2f(%d) | %s",
+                 symbol, dec.action, dec.score, regime,
+                 sent.get("sentiment", 0.0), sent.get("count", 0),
+                 "; ".join(dec.reasons[:3]))
+        if dec.action == "BUY" and not self.pf.has(symbol):
+            ok, why = RISK.pre_trade_checks(symbol, snap, ind, self.pf, prices)
+            if not ok:
+                LOG.info("[%s] ALIŞ engellendi: %s", symbol, ", ".join(why))
+                return
+            try:
+                equity = self.pf.equity(prices)
+                px = snap.get("ask") or snap["last"]
+                sl, _ = compute_sl_tp(self.cfg.risk, snap["last"], ind.get("atr"))
+                cons = ADAPTER.order_constraints(symbol)
+                qty, why = RISK.position_size(equity, px, sl, cons)
+                if qty <= 0:
+                    LOG.info("[%s] boyut 0: %s", symbol, why)
+                    return
+                pos = self.execution.market_buy(symbol, qty, px, ind.get("atr"))
+                if pos:
+                    LOG.info("[%s] >>> AÇILDI qty=%.8f @%s | SL=%s TP=%s",
+                             symbol, pos.amount, fmt_money(pos.entry_price),
+                             fmt_money(pos.stop_loss), fmt_money(pos.take_profit))
+            except TradingSystemError as e:
+                LOG.warning("[%s] alış başarısız: %s", symbol, e.user_message or e)
+        elif dec.action == "SELL":
+            if self.pf.has(symbol):
+                try:
+                    tr = self.execution.market_close(symbol, snap["last"], "sinyal")
+                    if tr:
+                        LOG.info("[%s] <<< SİNYALLE KAPANDI net=%s",
+                                 symbol, fmt_money(tr.net_pnl))
+                except TradingSystemError as e:
+                    LOG.warning("[%s] satış başarısız: %s", symbol, e.user_message or e)
+            elif CONFIG.futures.enabled:
+                ok, why = RISK.pre_trade_checks(symbol, snap, ind, self.pf, prices)
+                if not ok:
+                    LOG.info("[%s] SHORT engellendi: %s", symbol, ", ".join(why))
+                    return
+                try:
+                    equity = self.pf.equity(prices)
+                    px = snap.get("bid") or snap["last"]
+                    a = ind.get("atr")
+                    if _ok(a) and a > 0:
+                        sl_s = px + self.cfg.risk.atr_stop_multiplier * a
+                    else:
+                        sl_s = px * (1 + self.cfg.risk.default_stop_loss_pct / 100.0)
+                    cons = ADAPTER.order_constraints(symbol)
+                    # kısa pozisyon boyutu: ters parametre hilesi (stop fiyat üstünde)
+                    qty, why = RISK.position_size(equity, sl_s, px, cons)
+                    if qty <= 0:
+                        LOG.info("[%s] short boyut 0: %s", symbol, why)
+                        return
+                    pos = self.execution.market_sell_short(symbol, qty, px, a)
+                    if pos:
+                        LOG.info("[%s] >>> SHORT AÇILDI qty=%.8f @%s | SL=%s TP=%s",
+                                 symbol, pos.amount, fmt_money(pos.entry_price),
+                                 fmt_money(pos.stop_loss), fmt_money(pos.take_profit))
+                except TradingSystemError as e:
+                    LOG.warning("[%s] short başarısız: %s", symbol, e.user_message or e)
+            else:
+                LOG.info("[%s] satış sinyali ama pozisyon yok (spot mod — short kapalı)",
+                         symbol)
+
+# ---- 27B.4 main() V3 (futures modda doğru motorları kurar) ----
+def main():
+    print("=" * 60)
+    print("   MEXC BOT — START (V3: spot/swap çift mod)")
+    print("=" * 60)
+    mode = _select_mode()
+    CONFIG.mode = mode
+    print(f"Seçilen mod: {mode.value.upper()} | "
+          f"piyasa: {'SWAP ' + str(CONFIG.futures.leverage) + 'x' if CONFIG.futures.enabled else 'SPOT (kaldıraçsız)'}")
+
+    try:
+        mkts = ADAPTER.markets()
+        gecerli = [s for s in CONFIG.symbols
+                   if s in mkts and mkts[s].get("active", True)]
+        if gecerli:
+            CONFIG.symbols = gecerli
+    except TradingSystemError:
+        pass
+    print(f"Aktif semboller ({len(CONFIG.symbols)}): {CONFIG.symbols}")
+
+    if mode == TradingMode.BACKTEST:
+        stats, eq_df, _ = BacktesterV2().run("BTC/USDT")
+        print_report("BACKTEST RAPORU — BTC/USDT", stats)
+        plot_equity_curve(eq_df, "BTC/USDT Backtest Equity")
+        return
+
+    creds = request_credentials()
+    if mode == TradingMode.LIVE and not creds.api_key:
+        print("[DURDUR] CANLI mod için MEXC_API_KEY / MEXC_SECRET gerekli.")
+        return
+    if creds.api_key:
+        ADAPTER.attach_credentials(creds)
+        if CONFIG.futures.enabled and FUT_ADAPTER is not None:
+            FUT_ADAPTER.attach_credentials(creds)
+
+    start_balance = CONFIG.paper_start_balance
+    if creds.api_key:
+        try:
+            usdt = safe_float((ADAPTER.fetch_balance().get("total") or {}).get("USDT"), 0.0) or 0.0
+            print(f"MEXC USDT bakiyesi: {fmt_money(usdt)}")
+            if mode == TradingMode.LIVE:
+                if usdt <= 0:
+                    print("[DURDUR] USDT bakiye 0 — canlı işlem başlatılmadı.")
+                    return
+                start_balance = usdt
+        except TradingSystemError as e:
+            print(f"[UYARI] Bakiye doğrulanamadı: {e.user_message or e}")
+            if mode == TradingMode.LIVE:
+                print("[DURDUR] API doğrulanamadı — canlı işlem başlatılmadı.")
+                return
+
+    if mode == TradingMode.LIVE and not _confirm_live():
+        print("İptal edildi.")
+        return
+
+    if CONFIG.futures.enabled:
+        portfolio = FuturesPortfolio(mode.value, start_balance,
+                                     CONFIG.paper_fee_rate, CONFIG.paper_slippage_bps)
+        exec_adapter = FUT_ADAPTER if (mode == TradingMode.LIVE and FUT_ADAPTER) else ADAPTER
+        execution = FuturesExecutionEngine(exec_adapter, portfolio, CONFIG, DB)
+        bot = TradingBotV3(CONFIG, portfolio, execution)
+    else:
+        portfolio = Portfolio(mode.value, start_balance,
+                              CONFIG.paper_fee_rate, CONFIG.paper_slippage_bps)
+        execution = ExecutionEngineV2(ADAPTER, portfolio, CONFIG, DB)
+        bot = TradingBotV2(CONFIG, portfolio, execution)
+    print("\n▶ BOT ÇALIŞIYOR — durdurmak için CTRL+C\n")
+    bot.start()
+
+if __name__ == "__main__":
+    main()
