@@ -1,0 +1,8 @@
+# FOMC / CPI / NFP günlerini buraya ekleyin (YYYY-MM-DD ETIKET)
+# Bu gunlerde bot YENI ALIS yapmaz (satilan pozisyonlar etkilenmez).
+# Tarihleri https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm adresinden alin.
+#
+# Ornek format:
+# 2026-10-28 FOMC
+# 2026-11-12 CPI
+# 2026-11-06 NFP
