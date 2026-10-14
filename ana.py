@@ -4238,5 +4238,326 @@ def _fclose_29d(self, symbol, ref_price, reason):
 FuturesExecutionEngine.market_close = _fclose_29d
 
 print("[BÖLÜM 29D] AKTİF | hacim fallback + swap zaman stopu + swap MFE/MAE")
+# ============================================================
+# BÖLÜM 30 — SAĞLAMLAŞTIRMA PAKETİ (14 madde, append-only)
+# 30.1 Cache TTL/LRU (bellek sızıntısı koruması)
+# 30.2 Funding fee → journal (swap kapanışlarında)
+# 30.3 Yetim emir denetimi (run başlangıcında)
+# 30.4 Üst TF (4h) staleness → bayatsa sinyal flat
+# 30.5 SQLite "database is locked" retry + busy_timeout
+# 30.6 Hata sayacı + döngü özeti (sessiz yutma göstergesi)
+# 30.7 Dinamik stale data sınırı (yüksek volatilitede tazeleme sıklaşır)
+# 30.8 Emergency Safe Mode (bakiye min altına düşerse girişler durur)
+# 30.9 Null-tick donma algılama (fiyat çok uzun süre değişmezse alarm)
+# 30.10 SQLite bakımı (eski signals/decisions temizliği + wal checkpoint)
+# 30.11 HTML/Cloudflare yanıt koruması (JSON parse hataları retry'a düşer)
+# 30.12 Sunucu taraflı SL (canlı+spot, DEFAULT KAPALI — SERVER_SL_ENABLED=1 ile)
+# 30.13 Partial fill oranı loglaması
+# 30.14 Backtest dinamik kayma (ATR bazlı slip formülü — V3 backtester)
+# ============================================================
+print("[BÖLÜM 30] Sağlamlaştırma paketi yükleniyor...")
+
+# ---- 30.5 SQLite locked-retry (en kritik altyapı yaması) ----
+_orig_exec30 = Database._exec
+
+def _exec30(self, sql, params=()):
+    delays = (0.2, 0.5, 1.0)
+    last_e = None
+    for d in delays:
+        try:
+            return _orig_exec30(self, sql, params)
+        except sqlite3.OperationalError as e:
+            if "locked" not in str(e).lower() and "busy" not in str(e).lower():
+                raise
+            last_e = e
+            time.sleep(d)
+    raise last_e
+
+Database._exec = _exec30
+try:
+    DB.conn.execute("PRAGMA busy_timeout=5000;")
+except Exception:
+    pass
+LOG.info("[30.5] SQLite locked-retry AKTİF (3 deneme, busy_timeout=5000ms).")
+
+# ---- 30.1 Cache TTL + LRU temizliği ----
+CACHE_MAX_KEYS = int(safe_float(os.environ.get("CACHE_MAX_KEYS"), 80) or 80)
+CACHE_TTL_SEC = safe_float(os.environ.get("CACHE_TTL_SEC"), 6 * 3600.0) or 6 * 3600.0
+
+def _prune_cache30(engine):
+    now = time.time()
+    try:
+        for key in list(engine._ohlcv_cache.keys()):
+            item = engine._ohlcv_cache.get(key)
+            if item is None or now - item.get("fetched", now) > CACHE_TTL_SEC:
+                engine._ohlcv_cache.pop(key, None)
+        if len(engine._ohlcv_cache) > CACHE_MAX_KEYS:
+            excess = sorted(engine._ohlcv_cache.items(),
+                            key=lambda kv: kv[1].get("fetched", 0.0))[:-CACHE_MAX_KEYS]
+            for k, _ in excess:
+                engine._ohlcv_cache.pop(k, None)
+        for key in list(engine._books.keys()):
+            if now - engine._books[key].get("_ts", now) > CACHE_TTL_SEC:
+                engine._books.pop(key, None)
+        if len(engine._tickers) > 200:
+            engine._tickers.clear()
+    except Exception as e:
+        LOG.debug("[30.1] cache temizlik: %s", e)
+
+_orig_snap30 = MarketDataEngine.snapshot
+
+def _snap30(self, symbol):
+    _prune_cache30(self)
+    return _orig_snap30(self, symbol)
+
+MarketDataEngine.snapshot = _snap30
+LOG.info("[30.1] Cache TTL/LRU AKTİF (max=%d anahtar, ttl=%.0fs).", CACHE_MAX_KEYS, CACHE_TTL_SEC)
+
+# ---- 30.2 Funding fee → journal (swap kapanışı) ----
+_orig_fclose30 = FuturesExecutionEngine.market_close
+
+def _fclose30(self, symbol, ref_price, reason):
+    pos = self.pf.positions.get(symbol) if self.pf else None
+    tr = _orig_fclose30(self, symbol, ref_price, reason)
+    if tr is None:
+        return None
+    try:
+        rate = None
+        try:
+            fr = self.adapter.fetch_funding_rate(spot_to_swap(symbol))
+            rate = safe_float(fr.get("fundingRate"))
+        except TradingSystemError:
+            rate = None
+        if rate is not None and tr.entry_price:
+            dur_h = max(0.5, (tr.closed_at - tr.opened_at) / 3600.0)
+            notional = tr.amount * tr.entry_price
+            sign = -1.0 if tr.side == "long" else 1.0   # long pozitif rate'te ÖDER
+            funding = sign * notional * rate * (dur_h / 8.0)
+            uid = f"{tr.symbol}-{int(tr.opened_at)}-{int(tr.closed_at)}-{reason}"
+            self.db._exec("UPDATE trade_journal SET funding_cost=? WHERE trade_uid=?",
+                          (round(funding, 6), uid))
+            LOG.info("[30.2][%s] funding kaydı: %.6f USDT (rate=%.4f%%, %.1fh)",
+                     symbol, funding, rate * 100, dur_h)
+    except Exception as e:
+        LOG.debug("[30.2] funding kaydı: %s", e)
+    return tr
+
+FuturesExecutionEngine.market_close = _fclose30
+LOG.info("[30.2] Funding fee journal entegrasyonu AKTİF (swap).")
+
+# ---- 30.3 Yetim emir denetimi (run başlangıcı) ----
+def _orphan_check30():
+    try:
+        oos = ADAPTER.fetch_open_orders()
+        if not oos:
+            LOG.info("[30.3] Yetim emir denetimi: borsada açık emir yok. ✓")
+            return
+        LOG.warning("[30.3] %d açık emir bulundu — denetleniyor...", len(oos))
+        for o in oos:
+            ts_ms = safe_float(o.get("timestamp"), 0.0) or 0.0
+            age_min = (time.time() - ts_ms / 1000.0) / 60.0 if ts_ms else 9999.0
+            if age_min > CONFIG.risk.stale_order_minutes:
+                LOG.warning("[30.3] Bayat emir iptal: %s %s (%.0f dk)",
+                            o.get("symbol"), o.get("id"), age_min)
+                try:
+                    ADAPTER.cancel_order(o.get("id"), o.get("symbol"))
+                except TradingSystemError as e:
+                    LOG.warning("[30.3] iptal başarısız: %s", e)
+    except FeatureNotSupportedError:
+        LOG.info("[30.3] Yetim emir denetimi: anahtar yok, atlandı.")
+    except TradingSystemError as e:
+        LOG.warning("[30.3] denetim: %s", e)
+
+# ---- 30.4 Üst TF staleness → bayat 4h verisiyle sinyal üretilmez ----
+_orig_mtf30 = StrategyEngine._multi_timeframe
+
+def _mtf30(self, ts, symbol, tf, price, df_high):
+    if df_high is not None and len(df_high) >= 2:
+        try:
+            last_close = df_high["ts"].iloc[-1] + pd.to_timedelta(
+                TF_SECONDS.get(self.cfg.higher_timeframe, 14400), unit="s")
+            if (utc_now() - last_close).total_seconds() > \
+                    2.5 * TF_SECONDS.get(self.cfg.higher_timeframe, 14400):
+                return _sig(ts, symbol, tf, "multi_timeframe", "flat", 0, price,
+                            "üst TF verisi bayat — sinyal yok")
+        except Exception:
+            pass
+    return _orig_mtf30(self, ts, symbol, tf, price, df_high)
+
+StrategyEngine._multi_timeframe = _mtf30
+LOG.info("[30.4] Üst TF staleness kontrolü AKTİF.")
+
+# ---- 30.7 + 30.9 + 30.10 döngü katmanı (zincirleme sarmalayıcı) ----
+_orig_cycle30 = TradingBotV2._cycle
+_freeze_track30 = {}
+_freeze_count30 = {}
+
+def _cycle30(self):
+    # 30.7 dinamik stale: volatilite yüksekse tazelik sınırı daralır
+    try:
+        if (os.environ.get("DYNAMIC_STALE", "1").strip().lower()
+                not in ("0", "false", "no")):
+            btc_snap = ENGINE._tickers.get("BTC/USDT")
+            if btc_snap is not None:
+                df_b = ENGINE.get_ohlcv("BTC/USDT", self.cfg.primary_timeframe, limit=30)
+                ap = safe_float((safe_float(atr(df_b).iloc[-1]) /
+                                 float(df_b["close"].iloc[-1])) * 100.0)
+                if _ok(ap):
+                    self.engine_max_age_backup = getattr(self, "engine_max_age_backup",
+                                                         ENGINE.max_age)
+                    ENGINE.max_age = 45.0 if ap > 4.0 else self.engine_max_age_backup
+    except Exception:
+        pass
+    # 30.9 null-tick donma algılama
+    try:
+        for s in self.cfg.symbols:
+            p = self.pf.equity({})
+            cur = ENGINE._tickers.get(s)
+            if cur is None or not _ok(cur.last):
+                continue
+            prev = _freeze_track30.get(s)
+            if prev is not None and abs(cur.last - prev) < 1e-12:
+                _freeze_count30[s] = _freeze_count30.get(s, 0) + 1
+                if _freeze_count30[s] == 15:
+                    TG.send(f"[ALARM] {s} fiyatı {15} döngüdür değişmiyor "
+                            f"(donma/veri sorusu).", "freeze", force=True)
+                    LOG.warning("[30.9][%s] null-tick şüphesi (%d döngü).",
+                                s, _freeze_count30[s])
+            else:
+                _freeze_count30[s] = 0
+            _freeze_track30[s] = cur.last
+    except Exception:
+        pass
+    _orig_cycle30(self)
+    # 30.10 DB bakımı (her 20 döngü)
+    if self.cycle % 20 == 0:
+        try:
+            cutoff = time.time() - 30 * 86400
+            DB._exec("DELETE FROM signals WHERE ts < ?", (cutoff,))
+            DB._exec("DELETE FROM decisions WHERE ts < ?", (cutoff,))
+            DB.conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            LOG.info("[30.10] DB bakım: 30 günden eski sinyal/karar temizlendi.")
+        except Exception as e:
+            LOG.debug("[30.10] bakım: %s", e)
+
+TradingBotV2._cycle = _cycle30
+if "TradingBotV3" in dir():
+    TradingBotV3._cycle = _cycle30
+LOG.info("[30.7/30.9/30.10] Dinamik stale + donma algılama + DB bakımı AKTİF.")
+
+# ---- 30.8 Emergency Safe Mode ----
+_orig_pre30 = RISK.pre_trade_checks
+
+def _pre30(symbol, snapshot, ind, portfolio, prices):
+    ok, reasons = _orig_pre30(symbol, snapshot, ind, portfolio, prices)
+    try:
+        if portfolio.mode != "backtest" and portfolio.cash < \
+                CONFIG.risk.min_order_quote_usdt * 3.0:
+            reasons.append("EMERGENCY SAFE MODE: kasa minimum tutarın 3x altında")
+            ok = False
+            if getattr(_pre30, "_warned", False) is False:
+                _pre30._warned = True
+                TG.send("[ALARM] Kasa minimum işlem tutarına yaklaştı — "
+                        "girişler güvenli modda durduruldu.", "risk", force=True)
+                LOG.warning("[30.8] EMERGENCY SAFE MODE: cash=%.2f", portfolio.cash)
+    except Exception:
+        pass
+    return ok, reasons
+
+RISK.pre_trade_checks = _pre30
+LOG.info("[30.8] Emergency Safe Mode AKTİF (cash < 3x min_order → giriş yok).")
+
+# ---- 30.11 HTML/Cloudflare yanıt koruması ----
+_orig_call30 = CcxtAdapter._call
+
+def _call30(self, fn, *a, **k):
+    try:
+        return _orig_call30(self, fn, *a, **k)
+    except ValueError as e:
+        raise RetryableError(f"JSON olmayan yanıt (HTML/Cloudflare?): {e}", backoff=5.0)
+
+CcxtAdapter._call = _call30
+LOG.info("[30.11] HTML/Cloudflare yanıt koruması AKTİF.")
+
+# ---- 30.12 Sunucu taraflı SL (yalnız canlı+spot, DEFAULT KAPALI) ----
+_SERVER_SL = (os.environ.get("SERVER_SL_ENABLED", "0").strip() == "1")
+_orig_mbuy30 = ExecutionEngineV2.market_buy
+
+def _mbuy30(self, symbol, amount, ref_price, atr_val, strategy="combined"):
+    pos = _orig_mbuy30(self, symbol, amount, ref_price, atr_val, strategy)
+    if (pos is not None and self.pf.mode == "live" and _SERVER_SL
+            and pos.stop_loss):
+        try:
+            srec = self.adapter.create_order(
+                symbol, "sell", "market", pos.amount,
+                params={"stopLossPrice": self.adapter.round_price(symbol, pos.stop_loss)},
+                client_tag="srv-sl")
+            self.db.upsert_order(srec)
+            LOG.info("[30.12][%s] Sunucu taraflı SL emri gönderildi (id=%s).",
+                     symbol, srec.order_id)
+        except TradingSystemError as e:
+            LOG.warning("[30.12][%s] sunucu SL gönderilemedi — bot-yönetimli SL sürüyor: %s",
+                        symbol, e)
+    return pos
+
+ExecutionEngineV2.market_buy = _mbuy30
+LOG.info("[30.12] Sunucu taraflı SL: %s (SERVER_SL_ENABLED=%s).",
+         "AKTİF" if _SERVER_SL else "KAPALI (canlıya geçişte değerlendirilecek)", _SERVER_SL)
+
+# ---- 30.13 Partial fill oranı loglaması ----
+_orig_afill30 = ExecutionEngineV2._await_fill
+
+def _afill30(self, rec, tries=5, delay=1.5):
+    filled, avg, fee = _orig_afill30(self, rec, tries, delay)
+    try:
+        if rec.amount and filled and filled < rec.amount:
+            ratio = filled / rec.amount
+            LOG.warning("[30.13][%s] KISMİ DOLUM: %.1f%% (%.8f/%.8f) — pozisyon dolan kadar açıldı.",
+                        rec.symbol, ratio * 100, filled, rec.amount)
+    except Exception:
+        pass
+    return filled, avg, fee
+
+ExecutionEngineV2._await_fill = _afill30
+LOG.info("[30.13] Partial fill takibi AKTİF.")
+
+# ---- 30.14 Backtest dinamik kayma (ATR bazlı) ----
+_orig_bt30 = BacktesterV2.run
+
+def _bt30(self, symbol, timeframe=None, limit=800, df_override=None):
+    tf = timeframe or CONFIG.primary_timeframe
+    df_use = df_override if df_override is not None else \
+        ENGINE.get_ohlcv(symbol, tf, limit=limit, min_candles=210)
+    try:
+        atr_base = safe_float(atr(df_use.tail(100)).iloc[-1])
+        px_base = float(df_use["close"].iloc[-1])
+        vol_pct = (atr_base / px_base) * 100.0 if (_ok(atr_base) and px_base) else 1.0
+    except Exception:
+        vol_pct = 1.0
+    dyn_bps = clamp(3.0 + vol_pct * 2.0, 5.0, 25.0)
+    saved_bps = CONFIG.paper_slippage_bps
+    CONFIG.paper_slippage_bps = dyn_bps
+    LOG.info("[30.14] Backtest dinamik slip: %.1f bps (volatilite %.2f%%).", dyn_bps, vol_pct)
+    try:
+        return _orig_bt30(self, symbol, timeframe=tf, limit=limit, df_override=df_use)
+    finally:
+        CONFIG.paper_slippage_bps = saved_bps
+
+BacktesterV2.run = _bt30
+LOG.info("[30.14] Backtest dinamik kayma AKTİF.")
+
+# ---- 30.3 tetikleyici (bot başlamadan önce) ----
+_orig_start30 = TradingBotV2.start
+
+def _start30(self):
+    if self.pf.mode == "live":
+        _orphan_check30()
+    return _orig_start30(self)
+
+TradingBotV2.start = _start30
+if "TradingBotV3" in dir():
+    TradingBotV3.start = _start30
+
+print("[BÖLÜM 30] Sağlamlaştırma paketi AKTİF — 14 alt sistem yüklendi.")
 if __name__ == "__main__":
     main()
