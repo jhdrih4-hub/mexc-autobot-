@@ -3741,17 +3741,10 @@ def main():
         portfolio = FuturesPortfolio(mode.value, start_balance,
                                      CONFIG.paper_fee_rate, CONFIG.paper_slippage_bps)
         ...
-    if CONFIG.futures.enabled:
-        portfolio = FuturesPortfolio(mode.value, start_balance,
-                                     CONFIG.paper_fee_rate, CONFIG.paper_slippage_bps)
-        exec_adapter = FUT_ADAPTER if (mode == TradingMode.LIVE and FUT_ADAPTER) else ADAPTER
-        execution = FuturesExecutionEngine(exec_adapter, portfolio, CONFIG, DB)
-        bot = TradingBotV3(CONFIG, portfolio, execution)
-    else:
         portfolio = Portfolio(mode.value, start_balance,
-                              CONFIG.paper_fee_rate, CONFIG.paper_slippage_bps)
-        execution = ExecutionEngineV2(ADAPTER, portfolio, CONFIG, DB)
-        bot = TradingBotV2(CONFIG, portfolio, execution)
+                          CONFIG.paper_fee_rate, CONFIG.paper_slippage_bps)
+    execution = ExecutionEngineV2(ADAPTER, portfolio, CONFIG, DB)
+    bot = TradingBotV2(CONFIG, portfolio, execution)
     print("\n▶ BOT ÇALIŞIYOR — durdurmak için CTRL+C\n")
     bot.start()
 # ============================================================
