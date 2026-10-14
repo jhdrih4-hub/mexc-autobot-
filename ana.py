@@ -2430,7 +2430,7 @@ class BalanceManager:
             f"1) Borsa bakiyesi (MEXC spot): {fmt_money(self.total) if ok else 'UNKNOWN'} USDT",
             f"2) Kullanılabilir: {fmt_money(self.free) if ok else 'UNKNOWN'} USDT",
             f"3) Kullanımda: {fmt_money(self.used) if ok else 'UNKNOWN'} USDT",
-            f"4) PAPER bakiyesi (simüle): {fmt_money(portfolio.cash)} USDT",
+            f"4) PAPER kasası (nakit): {fmt_money(portfolio.cash)} | TOPLAM SERVET: {fmt_money(portfolio.equity(prices))} USDT",
             f"5) Açık pozisyon: {len(portfolio.positions)}",
             f"6) Unrealized PnL: {fmt_money(portfolio.unrealized(prices))} USDT",
             f"7) Realized PnL: {fmt_money(portfolio.realized)} USDT",
