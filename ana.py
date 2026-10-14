@@ -3744,6 +3744,8 @@ def main():
         portfolio = Portfolio(mode.value, start_balance,
                           CONFIG.paper_fee_rate, CONFIG.paper_slippage_bps)
     execution = ExecutionEngineV2(ADAPTER, portfolio, CONFIG, DB)
+        portfolio = Portfolio(mode.value, start_balance,
+                          CONFIG.paper_fee_rate, CONFIG.paper_slippage_bps)
     bot = TradingBotV2(CONFIG, portfolio, execution)
     print("\n▶ BOT ÇALIŞIYOR — durdurmak için CTRL+C\n")
     bot.start()
