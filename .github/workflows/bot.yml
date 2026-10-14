@@ -1,6 +1,8 @@
 # ============================================================
 #  MEXC TICARET BOTU — GITHUB ACTIONS WORKFLOW
 #  Dosya konumu: .github/workflows/bot.yml
+#  NOT: TRADING_MARKET su an "swap" — vadeli (futures) motoru AKTIF.
+#  Sadece spot'a donmek istersen asagidaki satiri "spot" yap.
 # ============================================================
 
 name: trading-bot
@@ -57,8 +59,8 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           KILL_SWITCH: ${{ vars.KILL_SWITCH }}
-          TRADING_MARKET: ${{ vars.TRADING_MARKET }}
-          FUTURES_LEVERAGE: ${{ vars.FUTURES_LEVERAGE }}
+          TRADING_MARKET: swap
+          FUTURES_LEVERAGE: "3"
           MAX_RUNTIME_MINUTES: "330"
 
       - name: Ozet rapor
@@ -79,4 +81,3 @@ jobs:
           except Exception as e:
               print(f"[OZET] {e}")
           EOF
-          
