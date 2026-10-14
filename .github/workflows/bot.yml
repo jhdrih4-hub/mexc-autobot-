@@ -77,5 +77,4 @@ jobs:
           except Exception as e:
               print(f"[OZET] {e}")
           EOF
-          TRADING_MARKET: ${{ vars.TRADING_MARKET }}
-          FUTURES_LEVERAGE: ${{ vars.FUTURES_LEVERAGE }}
+          
