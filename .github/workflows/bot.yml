@@ -57,6 +57,8 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           KILL_SWITCH: ${{ vars.KILL_SWITCH }}
+          TRADING_MARKET: ${{ vars.TRADING_MARKET }}
+          FUTURES_LEVERAGE: ${{ vars.FUTURES_LEVERAGE }}
           MAX_RUNTIME_MINUTES: "330"
 
       - name: Ozet rapor
