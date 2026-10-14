@@ -5077,5 +5077,102 @@ except Exception:
 
 print("[BÖLÜM 32E] Güvenlik zinciri AKTİF — paper'da gerçek emir İMKÂNSIZ, "
       "futures olmayan semboller filtreli.")
+# ============================================================
+# BÖLÜM 33 — DENETİM YAMASI (#73 analizi)
+# 33.1 Swap kapanışlarında entry_ctx temizliği (bozuk ctx riski)
+# 33.2 Döngü özeti: swap pozisyon sayısı + swap equity raporlanır
+#      (5 SHORT açıkken "açık pozisyon=1" yanılgısı biter)
+# 33.3 Shutdown'da swap state garantisi (zaten vardı, idempotent)
+# 33.4 Korelasyon kapısının vadeliye bağlanması (aynı yöne 5 bahis koruması)
+# ============================================================
+print("[BÖLÜM 33] Denetim yaması yükleniyor...")
+
+# ---- 33.1 entry_ctx temizliği (swap kapanış yolları) ----
+_orig_fclose33 = FuturesExecutionEngine.market_close
+
+def _wrap33_fclose(self, symbol, ref_price, reason):
+    self.entry_ctx.pop(symbol, None)
+    return _orig_fclose33(self, symbol, ref_price, reason)
+
+FuturesExecutionEngine.market_close = _wrap33_fclose
+LOG.info("[33.1] Swap market_close: entry_ctx temizliği bağlandı.")
+
+# ---- 33.2 döngü özeti çift motor ----
+_orig_cycle33 = TradingBotV2._cycle
+
+def _cycle33(self):
+    _orig_cycle33(self)
+    try:
+        if SWAP_RUNNER is not None and SWAP_RUNNER.pf is not None:
+            spf = SWAP_RUNNER.pf
+            prices_s = {}
+            for s, p in spf.positions.items():
+                try:
+                    prices_s[s] = ENGINE.get_ticker(s).last
+                except TradingSystemError:
+                    prices_s[s] = p.entry_price
+            swap_eq = spf.equity(prices_s)
+            unreal_s = spf.unrealized(prices_s)
+            LOG.info("SWAP DURUM | pozisyon=%d | cash=%s | unrealized=%+s | swap-equity=%s",
+                     len(spf.positions), fmt_money(spf.cash),
+                     fmt_money(unreal_s), fmt_money(swap_eq))
+    except Exception as e:
+        LOG.debug("[33.2] özet: %s", e)
+
+TradingBotV2._cycle = _cycle33
+if "TradingBotV3" in dir():
+    TradingBotV3._cycle = _cycle33
+LOG.info("[33.2] Çift-motor döngü özeti AKTİF (swap sayısı+equity raporlanır).")
+
+# ---- 33.3 shutdown swap-state garanti (idempotent) ----
+_orig_shutdown33 = TradingBotV2._shutdown
+
+def _shutdown33(self):
+    try:
+        if SWAP_RUNNER is not None:
+            SWAP_RUNNER.save_state()
+            LOG.info("[33.3] shutdown: swap state kaydedildi (pozisyon=%d).",
+                     len(SWAP_RUNNER.pf.positions) if SWAP_RUNNER.pf else 0)
+    except Exception as e:
+        LOG.warning("[33.3] swap state: %s", e)
+    _orig_shutdown33(self)
+
+TradingBotV2._shutdown = _shutdown33
+if "TradingBotV3" in dir():
+    TradingBotV3._shutdown = _shutdown33
+LOG.info("[33.3] Shutdown swap-state garantisi bağlandı.")
+
+# ---- 33.4 korelasyon kapısı → vadeli ----
+_orig_step33 = SwapEngineRunner.step
+
+def _wrap33_step(self, symbol, snap, signals, weights, regime, sent, prices_spot, ind=None):
+    if not self.pf.has(symbol) and len(self.pf.positions) >= CORR_MIN_POSITIONS:
+        try:
+            rc = _ret50(symbol)
+            if rc is not None:
+                cors = []
+                for s in list(self.pf.positions):
+                    rp = _ret50(s)
+                    if rp is None or len(rp) != len(rc):
+                        continue
+                    if np.std(rc) < 1e-12 or np.std(rp) < 1e-12:
+                        continue
+                    c = float(np.corrcoef(rc, rp)[0, 1])
+                    if math.isfinite(c):
+                        cors.append(c)
+                if cors and (sum(cors) / len(cors)) > CORR_MAX:
+                    LOG.info("[33.4][%s] vadeli giriş engellendi: korelasyon %.2f>%s",
+                             symbol, sum(cors) / len(cors), CORR_MAX)
+                    return
+        except TradingSystemError:
+            pass
+    return _orig_step33(self, symbol, snap, signals, weights, regime, sent,
+                        prices_spot, ind)
+
+SwapEngineRunner.step = _wrap33_step
+LOG.info("[33.4] Korelasyon kapısı vadeliye bağlandı (>%s @ %d+ pozisyon).",
+         CORR_MAX, CORR_MIN_POSITIONS)
+
+print("[BÖLÜM 33] Denetim yaması AKTİF — 4 yükleme.")
 if __name__ == "__main__":
     main()
