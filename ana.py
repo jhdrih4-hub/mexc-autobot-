@@ -3118,7 +3118,6 @@ def main():
     print("\n▶ BOT ÇALIŞIYOR — durdurmak için CTRL+C (Colab'da durdur butonu)\n")
     bot.start()
 
-if __name__ == "__main__":
     main()
 # ============================================================
 # BÖLÜM 27 — FUTURES (SWAP) MOTORU: KALDIRAÇLI LONG + SHORT
