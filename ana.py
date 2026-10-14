@@ -4762,5 +4762,176 @@ if "TradingBotV3" in dir():
 LOG.info("[32B.1] Volatilite ölçümü cache-dışı probe'a geçti (cache kirliliği bitti).")
 
 print("[BÖLÜM 32B] Mantık yamaları AKTİF — BTC cache fix + short kapısı açık.")
+# ============================================================
+# BÖLÜM 32C — KRİTİK YAMA (3 bug)
+# 32C.1 CcxtAdapter.set_leverage eklendi (canlıda gerekli)
+# 32C.2 'paper-swap' modu → 'paper' normalize: vadeli motor artık
+#       DAİMA simülasyon yolunda; borsa-emir yolu paper'da kapalı.
+#       (Swap ayrımı journal'da market_type='swap' kolonuyla korunur.)
+# 32C.3 30.7 cache-kirleten prob devre dışı (DYNAMIC_STALE=0) —
+#       dinamik stale artık yalnız 32B.1 cache-dışı probe ile.
+# 32C.4 Yeni swap step: ATR sinyallerden gelir (cache kirlemez),
+#       short boyutu doğru hesaplanır, zincir tek kapıya indirgenir.
+# ============================================================
+print("[BÖLÜM 32C] Kritik yamalar yükleniyor...")
+
+# ---- 32C.1 set_leverage ----
+def _set_lev32c(self, symbol, leverage):
+    params = {"openType": 2, "positionType": 1} if self.market_type != "spot" else {}
+    return self._call(self.client.set_leverage, leverage, symbol, params)
+CcxtAdapter.set_leverage = _set_lev32c
+LOG.info("[32C.1] CcxtAdapter.set_leverage eklendi (yalnız canlı yolunda çağrılır).")
+
+# ---- 32C.2 mode normalizasyonu ----
+_fpf_init32c = FuturesPortfolio.__init__
+
+def _fpf_init32c(self, mode, start_balance, fee_rate, slippage_bps):
+    _fpf_init32c(self, "paper" if str(mode).startswith("paper") else mode,
+                 start_balance, fee_rate, slippage_bps)
+    self.swap_tag = str(mode)
+
+FuturesPortfolio.__init__ = _fpf_init32c
+LOG.info("[32C.2] FuturesPortfolio mode normalizasyonu AKTİF — paper'da borsa-emir yolu kapalı.")
+
+# ---- 32C.3 eski cache-kirleten probu kapat ----
+os.environ["DYNAMIC_STALE"] = "0"
+LOG.info("[32C.3] 30.7 eski volatilite probu devre dışı; dinamik stale 32B.1 probe ile sürüyor.")
+
+# ---- 32C.4 yeni swap step ----
+_psize32c_base = globals().get("_orig_psize_29c") or globals().get("_orig_psize29b") or RISK.position_size
+
+def _swap_step_32c(self, symbol, snap, signals, weights, regime, sent, prices_spot, ind=None):
+    if not self.pf or not self.execution:
+        return
+    try:
+        SWAP_RISK.update_day_anchor(self.pf.equity({symbol: snap.get("last") or 0.0}))
+    except Exception:
+        pass
+    # 1) açık pozisyon stopları
+    try:
+        tr = self.execution.check_stops(symbol, snap["last"])
+        if tr:
+            LOG.info("[SWAP][%s] POZİSYON KAPANDI (%s) net=%s",
+                     symbol, tr.close_reason, fmt_money(tr.net_pnl))
+            if tr.close_reason == "stop_loss":
+                RISK.register_stop_hit(symbol + "-swap")
+    except TradingSystemError as e:
+        LOG.warning("[SWAP][%s] stop kontrolü: %s", symbol, e)
+        return
+    # 2) karar
+    dec = DECISION.decide(symbol, snap, signals, weights, sent,
+                          self.pf.has(symbol), regime)
+    try:
+        if dec.action in ("BUY", "SELL"):
+            DB.save_decision(dec)
+    except Exception:
+        pass
+    # 3) ortak kapı
+    def _gate32c():
+        try:
+            ind_g = {}
+            if ind and _ok(ind.get("atr_pct")):
+                ind_g["atr_pct"] = ind.get("atr_pct")
+            okg, whyg = SWAP_RISK.pre_trade_checks(symbol, snap, ind_g,
+                                                   _SwapGatePf(self.pf),
+                                                   {symbol: snap.get("last") or 0.0})
+            if not okg:
+                soft = [w for w in whyg if "hacim" not in w and "1h trend" not in w]
+                if soft:
+                    LOG.info("[SWAP][%s] giriş engellendi: %s", symbol, ", ".join(soft))
+                    return False
+                LOG.info("[SWAP][%s] yumuşak engel geçildi: %s", symbol, ", ".join(whyg))
+            return True
+        except Exception as e:
+            LOG.warning("[SWAP][%s] kapı hatası (engellendi): %s", symbol, e)
+            return False
+    # 4) boyutlandırma (risk_scale=0.5)
+    def _psize32c(equity, price, stop_price, cons):
+        return _psize32c_base(equity * CONFIG.futures.risk_scale, price, stop_price, cons)
+
+    # 5) BUY → kaldıraçlı LONG
+    if dec.action == "BUY" and not self.pf.has(symbol):
+        if not _gate32c():
+            return
+        try:
+            px = snap.get("ask") or snap["last"]
+            a = ind.get("atr") if ind else None
+            sl, _ = compute_sl_tp(CONFIG.risk, px, a)
+            cons = ADAPTER.order_constraints(symbol)
+            qty, why = _psize32c(self.pf.equity({symbol: px}), px, sl, cons)
+            if qty > 0:
+                pos = self.execution.market_buy(symbol, qty, px, a)
+                if pos:
+                    LOG.info("[SWAP][%s] >>> LONG AÇILDI %.8f @%s | SL=%s TP=%s",
+                             symbol, pos.amount, fmt_money(pos.entry_price),
+                             fmt_money(pos.stop_loss), fmt_money(pos.take_profit))
+        except TradingSystemError as e:
+            LOG.warning("[SWAP][%s] long başarısız: %s", symbol, e)
+    # 6) SELL → kapat VEYA SHORT aç
+    elif dec.action == "SELL":
+        if self.pf.has(symbol):
+            try:
+                tr = self.execution.market_close(symbol, snap["last"], "sinyal")
+                if tr:
+                    LOG.info("[SWAP][%s] <<< KAPANDI net=%s",
+                             symbol, fmt_money(tr.net_pnl))
+            except TradingSystemError as e:
+                LOG.warning("[SWAP][%s] kapanış: %s", symbol, e)
+        else:
+            if not _gate32c():
+                return
+            try:
+                px = snap.get("bid") or snap["last"]
+                a = ind.get("atr") if ind else None
+                if not (_ok(a) and a > 0):
+                    try:  # cache-DIŞI ATR probe (ENGINE cache kirletilmez)
+                        raw = ADAPTER.fetch_ohlcv_df(symbol, CONFIG.primary_timeframe, 60)
+                        closed = MarketDataEngine.to_closed(raw.copy(), CONFIG.primary_timeframe)
+                        a = safe_float(atr(closed).iloc[-1])
+                    except TradingSystemError:
+                        a = None
+                if not (_ok(a) and a > 0):
+                    LOG.info("[SWAP][%s] short atlandı: ATR yok", symbol)
+                    return
+                sl_s = px + CONFIG.risk.atr_stop_multiplier * a
+                cons = ADAPTER.order_constraints(symbol)
+                qty, why = _psize32c(self.pf.equity({symbol: px}), sl_s, px, cons)
+                if qty > 0:
+                    pos = self.execution.market_sell_short(symbol, qty, px, a)
+                    if pos:
+                        LOG.info("[SWAP][%s] >>> SHORT AÇILDI %.8f @%s | SL=%s TP=%s",
+                                 symbol, pos.amount, fmt_money(pos.entry_price),
+                                 fmt_money(pos.stop_loss), fmt_money(pos.take_profit))
+            except TradingSystemError as e:
+                LOG.warning("[SWAP][%s] short başarısız: %s", symbol, e)
+
+SwapEngineRunner.step = _swap_step_32c
+
+# ---- 32C.5 dual wrapper: ind'i step'e geçir ----
+def _process_symbol_dual_32c(self, symbol, prices):
+    _orig_ps = getattr(self, "_orig_process_symbol_ref", None)
+    if _orig_ps is None:
+        return
+    _orig_ps(self, symbol, prices)
+    if SWAP_RUNNER is not None and CONFIG.futures.enabled:
+        try:
+            snap = ENGINE.snapshot(symbol)
+            df = ENGINE.get_ohlcv(symbol, self.cfg.primary_timeframe, min_candles=210)
+            try:
+                dfh = ENGINE.get_ohlcv(symbol, self.cfg.higher_timeframe, min_candles=210)
+            except TradingSystemError:
+                dfh = None
+            signals, ind = STRATEGIES.compute_all(symbol, df, dfh)
+            regime = REGIME.classify(df, ind)
+            weights = REGIME.adjust_weights(self.cfg.strategy_weights, regime)
+            sent = NEWS.sentiment_for(symbol)
+            SWAP_RUNNER.step(symbol, snap, signals, weights, regime, sent, prices, ind)
+        except TradingSystemError as e:
+            LOG.warning("[SWAP][%s] döngü: %s", symbol, e)
+
+_process_symbol_dual = _process_symbol_dual_32c  # mevcut wrapper bu ismi çağırır
+LOG.info("[32C.5] Dual wrapper: ind parametresi swap step'e geçiriliyor (cache temiz).")
+
+print("[BÖLÜM 32C] Kritik yamalar AKTİF — paper güvenliği + set_leverage + temiz short akışı.")
 if __name__ == "__main__":
     main()
