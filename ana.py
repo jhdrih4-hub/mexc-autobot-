@@ -3948,6 +3948,60 @@ def _shutdown_dual(self):
 TradingBotV2._shutdown = _shutdown_dual
 if "TradingBotV3" in dir():
     TradingBotV3._shutdown = _shutdown_dual
+# ============================================================
+# BÖLÜM 29B — SWAP MOTORU GÜVENLİK KAPISI + RİSK AYARI
+# Swap girişleri artık aynı kapılardan geçer: kill switch, günlük zarar
+# kilidi, makro, korelasyon, ML filtresi, 1h trend, spread/hacim.
+# Swap pozisyon riski = spot'un YARISI (risk_scale=0.5) — kaldıraç telafisi.
+# ============================================================
+print("[BÖLÜM 29B] Swap güvenlik kapısı bağlanıyor...")
+
+class _SwapGatePf:
+    """pre_trade_checks için swap portföyü köprüsü."""
+    def __init__(self, pf):
+        self._pf = pf
+        self.positions = pf.positions if pf else {}
+    def has(self, symbol):
+        return self._pf.has(symbol) if self._pf else False
+    def equity(self, prices):
+        return self._pf.equity(prices) if self._pf else 0.0
+
+_orig_swap_step29b = SwapEngineRunner.step
+_orig_psize29b = RISK.position_size
+
+def _swap_step_29b(self, symbol, snap, signals, weights, regime, sent, prices_spot):
+    # 1) Pozisyon YOKSA tam güvenlik kapısından geç
+    if self.pf and self.execution and not self.pf.has(symbol):
+        try:
+            ind_g = {}
+            df_g = ENGINE.get_ohlcv(symbol, self.cfg.primary_timeframe, limit=60, min_candles=50)
+            _a = safe_float(atr(df_g).iloc[-1])
+            _p = snap.get("last") or 0.0
+            if _a and _p > 0:
+                ind_g["atr_pct"] = _a / _p * 100.0
+        except TradingSystemError:
+            ind_g = {}
+        try:
+            okg, whyg = RISK.pre_trade_checks(symbol, snap, ind_g,
+                                              _SwapGatePf(self.pf),
+                                              {symbol: snap.get("last") or 0.0})
+            if not okg:
+                LOG.info("[SWAP][%s] giriş engellendi: %s", symbol, ", ".join(whyg))
+                return
+        except Exception as e:
+            LOG.warning("[SWAP][%s] kapı hatası (giriş engellendi): %s", symbol, e)
+            return
+    # 2) Swap boyutlandırması: risk_scale uygula (varsayılan 0.5 = yarı risk)
+    def _scaled_psize(equity, price, stop_price, cons):
+        return _orig_psize29b(equity * CONFIG.futures.risk_scale, price, stop_price, cons)
+    RISK.position_size = _scaled_psize
+    try:
+        return _orig_swap_step29b(self, symbol, snap, signals, weights, regime, sent, prices_spot)
+    finally:
+        RISK.position_size = _orig_psize29b
+
+SwapEngineRunner.step = _swap_step_29b
+print("[BÖLÜM 29B] Swap kapisi AKTIF | islem riski = spot x%.1f" % CONFIG.futures.risk_scale)
 if __name__ == "__main__":
     main()
 # ============================================================
