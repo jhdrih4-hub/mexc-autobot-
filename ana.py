@@ -4628,5 +4628,58 @@ LOG.info("[31.3] srv-SL kapanış temizliği bağlandı (SERVER_SL_ENABLED=%s)."
 
 LOG.info("[31.4] Aktif zincirler: spot=V2(+28/30) | swap=29C(SWAP_RISK)+30 | main=V3(son tanım)")
 print("[BÖLÜM 31] Audit consolidation AKTİF.")
+# ============================================================
+# BÖLÜM 32 — ACİL YAMA: 31.2 recursion bug düzeltmesi
+# Hata: sarmalayıcı ile orijinal aynı isimdi → fonksiyon kendini
+# çağırıyordu. Fix: bozuk attribute silinir, class-method'a
+# FARKLI isimle sarmalanır + referans doğrulaması eklenir.
+# ============================================================
+print("[BÖLÜM 32] Acil yama: swap kapı recursion düzeltmesi...")
+
+# 1) 31.2'nin bozuk sarmalayıcısını kaldır (class method'a geri dön)
+try:
+    del SWAP_RISK.pre_trade_checks
+    LOG.info("[32] Bozuk sarmalayıcı (31.2) kaldırıldı.")
+except AttributeError:
+    LOG.info("[32] Kaldırılacak bozuk attribute yok (zaten temiz).")
+
+# 2) Temiz referans yakala (FARKLI isim — bug'ın kökü buydu)
+_orig_swap_risk_pre32 = SWAP_RISK.pre_trade_checks
+
+_name32 = getattr(_orig_swap_risk_pre32, "__name__", "?")
+if _name32 == "pre_trade_checks":
+    LOG.info("[32] Temiz referans doğrulandı (class method).")
+else:
+    LOG.warning("[32] Beklenmeyen referans: %s", _name32)
+
+def _swap_risk_pre32(symbol, snapshot, ind, portfolio, prices):
+    ok, reasons = _orig_swap_risk_pre32(symbol, snapshot, ind, portfolio, prices)
+    try:
+        if CONFIG.mode != TradingMode.BACKTEST:
+            if getattr(CONFIG, "macro", None) and CONFIG.macro.enabled:
+                if MACRO.is_event_day():
+                    return False, reasons + ["[SWAP] makro olay günü — giriş kapalı"]
+                s = MACRO.get_scalar(symbol)
+                if s < CONFIG.macro.block_below:
+                    return False, reasons + [f"[SWAP] makro risk-off (skala={s:.2f})"]
+        cash = getattr(portfolio, "cash", None)
+        if cash is None:
+            cash = getattr(getattr(portfolio, "_pf", None), "cash", 0.0) or 0.0
+        if cash and cash < CONFIG.risk.min_order_quote_usdt * 3.0:
+            return False, reasons + ["[SWAP] EMERGENCY SAFE MODE (nakit düşük)"]
+    except Exception as e:
+        LOG.debug("[32] swap kapı eki: %s", e)
+    return ok, reasons
+
+SWAP_RISK.pre_trade_checks = _swap_risk_pre32
+
+# 3) Yapısal doğrulama: sarmalayıcı kendini çağıramaz (farklı isimler garanti)
+if _swap_risk_pre32.__name__ != _orig_swap_risk_pre32.__name__:
+    LOG.info("[32] Güvenlik doğrulaması OK — sarmalayıcı ve orijinal farklı fonksiyonlar.")
+else:
+    LOG.error("[32] KRİTİK: isimler çakışıyor — yama atlandı, kapı sarmalayıcıya bağlanmadı.")
+    del SWAP_RISK.pre_trade_checks
+
+print("[BÖLÜM 32] Swap kapı düzeltmesi TAMAM — makro + acil nakit kapısı korundu.")
 if __name__ == "__main__":
     main()
