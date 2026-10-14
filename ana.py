@@ -3734,7 +3734,193 @@ def main():
         bot = TradingBotV2(CONFIG, portfolio, execution)
     print("\n▶ BOT ÇALIŞIYOR — durdurmak için CTRL+C\n")
     bot.start()
+# ============================================================
+# BÖLÜM 29 — PARALEL ÇİFT MOTOR (spot + swap AYNI ANDA)
+# Spot motoru: her zaman çalışır (kaldıraçsız long)
+# Swap motoru: TRADING_MARKET=swap ise AYNI RUN'DA ek olarak çalışır
+# Bütçe: SPOT_BUDGET_PCT spot'a, kalan swap'a. Ayrı kasa/journal, tek log.
+# TRADING_MARKET=spot ise davranış TAM ESKİ GİBİ (tek motor) — güvenli geri dönüş.
+# ============================================================
+print("[BÖLÜM 29] Paralel çift motor katmanı yükleniyor...")
 
+SPOT_BUDGET_PCT = safe_float(os.environ.get("SPOT_BUDGET_PCT"), 60.0) or 60.0
+
+class SwapEngineRunner:
+    """Aynı döngüde swap motorunu spot motorunun YANINDA çalıştırır.
+    Spot'un gördüğü her sinyali swap tarafında long/short olarak değerlendirir."""
+
+    def __init__(self, config, db):
+        self.cfg = config
+        self.db = db
+        self.pf = None
+        self.execution = None
+        self.bot_tag = "swap"
+        self.cycle = 0
+
+    def setup(self, start_balance):
+        self.pf = FuturesPortfolio("paper-swap", start_balance,
+                                   CONFIG.paper_fee_rate, CONFIG.paper_slippage_bps)
+        self.execution = FuturesExecutionEngine(FUT_ADAPTER if FUT_ADAPTER else ADAPTER,
+                                                self.pf, CONFIG, DB)
+        LOG.info("[SWAP-MOTOR] kuruldu | bütçe=%s | kaldıraç=%dx",
+                 fmt_money(start_balance), CONFIG.futures.leverage)
+
+    def load_state(self):
+        v = DB.get_meta("swap_paper_state")
+        if not v:
+            return
+        try:
+            data = json.loads(v)
+            self.pf.cash = float(data.get("cash", self.pf.cash))
+            self.pf.start_balance = float(data.get("start", self.pf.start_balance))
+            for s, p in data.get("positions", {}).items():
+                self.pf.positions[s] = FuturesPosition(
+                    symbol=s, side=p.get("side", "long"),
+                    amount=float(p["amount"]), entry_price=float(p["entry"]),
+                    stop_loss=safe_float(p.get("sl")),
+                    take_profit=safe_float(p.get("tp")),
+                    opened_at=float(p.get("opened_at", 0)),
+                    strategy=str(p.get("strategy", "")),
+                    leverage=float(p.get("leverage", CONFIG.futures.leverage)))
+            LOG.info("[SWAP-MOTOR] önceki oturum: cash=%s pozisyon=%d",
+                     fmt_money(self.pf.cash), len(self.pf.positions))
+        except Exception as e:
+            LOG.warning("[SWAP-MOTOR] state yüklenemedi: %s", e)
+
+    def save_state(self):
+        if not self.pf:
+            return
+        data = {"cash": self.pf.cash, "start": self.pf.start_balance,
+                "positions": {s: {"amount": p.amount, "entry": p.entry_price,
+                                  "sl": p.stop_loss, "tp": p.take_profit,
+                                  "opened_at": p.opened_at, "strategy": p.strategy,
+                                  "side": p.side, "leverage": getattr(p, "leverage", 1.0)}
+                              for s, p in self.pf.positions.items()}}
+        try:
+            DB.set_meta("swap_paper_state", json.dumps(data))
+        except Exception as e:
+            LOG.warning("[SWAP-MOTOR] state kaydedilemedi: %s", e)
+
+    def step(self, symbol, snap, signals, weights, regime, sent, prices_spot):
+        """Spot döngüsü her sembolü işledikten sonra çağrılır."""
+        if not self.pf or not self.execution:
+            return
+        self.cycle += 1
+        prices = {symbol: snap["last"]}
+        try:
+            tr = self.execution.check_stops(symbol, snap["last"])
+            if tr:
+                LOG.info("[SWAP][%s] POZİSYON KAPANDI (%s) net=%s",
+                         symbol, tr.close_reason, fmt_money(tr.net_pnl))
+                if tr.close_reason == "stop_loss":
+                    RISK.register_stop_hit(symbol + "-swap")
+        except TradingSystemError as e:
+            LOG.warning("[SWAP][%s] stop kontrolü: %s", symbol, e)
+            return
+        dec = DECISION.decide(symbol, snap, signals, weights, sent,
+                              self.pf.has(symbol), regime)
+        try:
+            if dec.action in ("BUY", "SELL"):
+                DB.save_decision(dec)
+        except Exception:
+            pass
+        if dec.action == "BUY" and not self.pf.has(symbol):
+            try:
+                px = snap.get("ask") or snap["last"]
+                sl, _ = compute_sl_tp(CONFIG.risk, snap["last"], None)
+                cons = ADAPTER.order_constraints(symbol)
+                qty, why = RISK.position_size(self.pf.equity({symbol: snap["last"]}),
+                                              px, sl, cons)
+                if qty > 0:
+                    pos = self.execution.market_buy(symbol, qty, px, None)
+                    if pos:
+                        LOG.info("[SWAP][%s] >>> LONG AÇILDI %.8f @%s | SL=%s TP=%s",
+                                 symbol, pos.amount, fmt_money(pos.entry_price),
+                                 fmt_money(pos.stop_loss), fmt_money(pos.take_profit))
+            except TradingSystemError as e:
+                LOG.warning("[SWAP][%s] long başarısız: %s", symbol, e)
+        elif dec.action == "SELL" and not self.pf.has(symbol):
+            try:
+                px = snap.get("bid") or snap["last"]
+                a = None
+                try:
+                    df = ENGINE.get_ohlcv(symbol, CONFIG.primary_timeframe, limit=30)
+                    a = safe_float(atr(df).iloc[-1])
+                except TradingSystemError:
+                    a = None
+                if _ok(a) and a > 0:
+                    sl_s = px + CONFIG.risk.atr_stop_multiplier * a
+                    cons = ADAPTER.order_constraints(symbol)
+                    qty, why = RISK.position_size(self.pf.equity({symbol: snap["last"]}),
+                                                  sl_s, px, cons)
+                    if qty > 0:
+                        pos = self.execution.market_sell_short(symbol, qty, px, a)
+                        if pos:
+                            LOG.info("[SWAP][%s] >>> SHORT AÇILDI %.8f @%s | SL=%s TP=%s",
+                                     symbol, pos.amount, fmt_money(pos.entry_price),
+                                     fmt_money(pos.stop_loss), fmt_money(pos.take_profit))
+            except TradingSystemError as e:
+                LOG.warning("[SWAP][%s] short başarısız: %s", symbol, e)
+        elif dec.action == "SELL" and self.pf.has(symbol):
+            try:
+                tr = self.execution.market_close(symbol, snap["last"], "sinyal")
+                if tr:
+                    LOG.info("[SWAP][%s] <<< KAPANDI net=%s", symbol, fmt_money(tr.net_pnl))
+            except TradingSystemError as e:
+                LOG.warning("[SWAP][%s] kapanış: %s", symbol, e)
+
+    def report_line(self):
+        if not self.pf:
+            return ""
+        eq = self.pf.cash
+        return (f"[SWAP] cash={fmt_money(self.pf.cash)} pozisyon={len(self.pf.positions)} "
+                f"realized={fmt_money(self.pf.realized)}")
+
+SWAP_RUNNER = None
+
+_orig_cycle29 = TradingBotV3._cycle if "TradingBotV3" in dir() else TradingBotV2._cycle
+
+def _cycle_dual(self):
+    _orig_cycle29(self)
+
+def _process_symbol_dual(self, symbol, prices):
+    _orig_ps = getattr(self, "_orig_process_symbol_ref", None)
+    if _orig_ps is None:
+        return
+    _orig_ps(self, symbol, prices)
+    if SWAP_RUNNER is not None and CONFIG.futures.enabled:
+        try:
+            snap = ENGINE.snapshot(symbol)
+            df = ENGINE.get_ohlcv(symbol, self.cfg.primary_timeframe, min_candles=210)
+            try:
+                dfh = ENGINE.get_ohlcv(symbol, self.cfg.higher_timeframe, min_candles=210)
+            except TradingSystemError:
+                dfh = None
+            signals, ind = STRATEGIES.compute_all(symbol, df, dfh)
+            regime = REGIME.classify(df, ind)
+            weights = REGIME.adjust_weights(self.cfg.strategy_weights, regime)
+            sent = NEWS.sentiment_for(symbol)
+            SWAP_RUNNER.step(symbol, snap, signals, weights, regime, sent, prices)
+        except TradingSystemError as e:
+            LOG.warning("[SWAP][%s] döngü: %s", symbol, e)
+
+TradingBotV2._cycle = _cycle_dual
+if "TradingBotV3" in dir():
+    TradingBotV3._cycle = _cycle_dual
+
+_orig_ps29 = TradingBotV2._process_symbol
+if "TradingBotV3" in dir():
+    _orig_ps29_v3 = TradingBotV3._process_symbol
+
+def _ps_wrapper(self, symbol, prices):
+    self._orig_process_symbol_ref = _orig_ps29_v3 if "TradingBotV3" in dir() and isinstance(self, TradingBotV3) else _orig_ps29
+    _process_symbol_dual(self, symbol, prices)
+
+TradingBotV2._process_symbol = _ps_wrapper
+if "TradingBotV3" in dir():
+    TradingBotV3._process_symbol = _ps_wrapper
+
+print("[BÖLÜM 29] Paralel çift motor hazır (spot her zaman; swap TRADING_MARKET=swap ile).")
 if __name__ == "__main__":
     main()
 # ============================================================
