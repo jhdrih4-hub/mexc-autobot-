@@ -5960,5 +5960,36 @@ except Exception as e:
     raise
 
 print("[BÖLÜM 41] TAMAM — anchor artık gerçekten yazılıyor (MethodType fix).")
+# ============================================================
+# BÖLÜM 42 — HABER DOĞRULAMA & GÜVENİLİRLİK KATMANI (tam)
+# 42.1 Kaynak güvenilirliği (exact/subdomain tablo; sahte benzer
+#      alan adları elenen — "fakecoindesk.com" ≠ "coindesk.com")
+# 42.2 Story kümeleme (Jaccard≥0.55) → aynı haber tekrar sayılmaz
+# 42.3 Basın-kopyası ayrımı (aynı story'de title Jaccard≥0.90 farklı
+#      site = KOPYA → bağımsız doğrulama SAYILMAZ)
+# 42.4 Bağımsız doğrulama: farklı güvenilir netloc sayısı ≥2 → ×1.15
+# 42.5 Çelişki (aynı story, zıt |s|>0.30) → güven ×0.50
+# 42.6 Doğrulanmamış kritik haber cap (bağımsız<2 ve |puan|>0.60 → ×0.60)
+# 42.7 Geçersiz/gelecek tarih koruması (clamp + log)
+# 42.8 Genel piyasa haberi (asset yok) → yalnız MARKET_PROXY paritel
+#      grubuna, ölçekli (0.5×) uygulanır
+# 42.9 sentiment_for çıktısı formatı KORUNUR: {"sentiment", "count"}
+#      (count = bağımsız story sayısı; DecisionEngine cnt>=3 şartı aynen)
+# 42.10 Detaylı haber logu (throttle'lu) + sıfır-veri nötr logu
+# Kapsam: NewsEngine.refresh/sentiment_for davranışı korunur; risk
+# kontrolleri, motorlar, PAPER modu, DecisionEngine cap'i DOKUNULMADI.
+# ============================================================
+print("[BÖLÜM 42] Haber doğrulama & güvenilirlik katmanı yükleniyor...")
+
+NEWS_TRUST = {
+    "reuters.com":        ("news_major", 0.95),
+    "bloomberg.com":      ("news_major", 0.95),
+    "coindesk.com":       ("news_major", 0.90),
+    "theblock.co":        ("news_major", 0.88),
+    "cointelegraph.com":  ("news_major", 0.85),
+    "decrypt.co":         ("news_major", 0.80),
+    "cryptoslate.com":    ("news_agg",    0.70),
+    "mexc.com":           ("exchange_official", 0.95),
+    "binance.com":
 if __name__ == "__main__":
     main()
