@@ -5990,7 +5990,11 @@ NEWS_TRUST = {
     "decrypt.co":         ("news_major", 0.80),
     "cryptoslate.com":    ("news_agg",    0.70),
     "mexc.com":           ("exchange_official", 0.95),
-    "binance.com":
+    "binance.com":        ("exchange_official", 0.95)
+}
+
+print("[BÖLÜM 42] Haber doğrulama & güvenilirlik katmanı yüklendi.")
+    
 # ============================================================
 # BÖLÜM 43 — ADAPTİF REJİM + DİNAMİK RİSK (gerçek eksikler)
 # 43.1 Genişletilmiş rejim: strong/weak trend ayrımı + kısa/orta/uzun
