@@ -5624,5 +5624,98 @@ SwapEngineRunner.step = _swap_step39
 LOG.info("[39] Funding filtresi DÜZELTİLDİ (yol: execution.adapter) ve zincire bağlandı.")
 
 print("[BÖLÜM 39] TAMAM — vadeli motor sağlıklı, funding filtresi doğru yolda.")
+# ============================================================
+# BÖLÜM 40 — CHATGPT DENETİM DÜZELTMELERİ (4 madde)
+# 40.1 CcxtAdapter.cancel_order eklendi (eksik metod — canlı öncesi ZORUNLU)
+# 40.2 Vadeli canlı yolu FUT_ADAPTER constraints kullanır (spot mix düzeltilir)
+# 40.3 Günlük anchor meta'ya yazılır → restart'ta aynı gün anchor'ı geri yüklenir
+# 40.4 _await_fill: dolum yoksa kalan emir iptal denemesi (mükerrer emir önleme)
+# ============================================================
+print("[BÖLÜM 40] Denetim düzeltmeleri yükleniyor...")
+
+# ---- 40.1 cancel_order (eksik metod) ----
+def _cancel_order40(self, order_id, symbol=None):
+    RATE.wait("cancel")
+    return self._call(self.client.cancel_order, order_id, symbol)
+CcxtAdapter.cancel_order = _cancel_order40
+LOG.info("[40.1] CcxtAdapter.cancel_order eklendi (çığırtkan çağrılar artık güvenli).")
+
+# ---- 40.2 vadeli constraints FUT_ADAPTER'dan ----
+_orig_fopen40 = FuturesExecutionEngine._open_common
+
+def _fopen40(self, symbol, amount, ref_price, atr_val, side, strategy):
+    # canlı yolunda doğru adapter'ın constraints'ını kullan
+    if (self.pf.mode == "live" and FUT_ADAPTER is not None
+            and self.adapter is not FUT_ADAPTER):
+        try:
+            cons_f = FUT_ADAPTER.order_constraints(spot_to_swap(symbol))
+            amount = FUT_ADAPTER.round_amount(spot_to_swap(symbol), amount)
+            if amount <= 0 or amount < cons_f.get("amount_min") or 0:
+                raise TradeBlockedError(f"{symbol}: vadeli miktar min altı")
+        except TradingSystemError as e:
+            raise TradeBlockedError(f"[40.2] vadeli constraints: {e}")
+    return _orig_fopen40(self, symbol, amount, ref_price, atr_val, side, strategy)
+
+FuturesExecutionEngine._open_common = _fopen40
+LOG.info("[40.2] Vadeli canlı yolu FUT_ADAPTER precision/min-qty kullanacak.")
+
+# ---- 40.3 günlük anchor kalıcılığı (restart güvenli) ----
+_anchor_key40 = f"day_anchor:{utc_now().date()}:swap"
+try:
+    _saved40 = DB.get_meta(_anchor_key40)
+    if _saved40:
+        SWAP_RISK._day = str(utc_now().date())
+        SWAP_RISK._day_start_equity = float(_saved40)
+        LOG.info("[40.3] Gün anchor'ı meta'dan geri yüklendi: %s", fmt_money(SWAP_RISK._day_start_equity))
+    else:
+        DB.set_meta(_anchor_key40, "0")   # ilk yazım cycle'da güncellenecek
+except Exception as e:
+    LOG.debug("[40.3] anchor restore: %s", e)
+
+_orig_cycle40 = TradingBotV2._cycle
+
+def _cycle40(self):
+    _orig_cycle40(self)
+    try:
+        if SWAP_RUNNER is not None and SWAP_RUNNER.pf is not None:
+            prices_a = {}
+            for s, p in SWAP_RUNNER.pf.positions.items():
+                try:
+                    prices_a[s] = ENGINE.get_ticker(s).last
+                except TradingSystemError:
+                    prices_a[s] = p.entry_price
+            SWAP_RISK.update_day_anchor(SWAP_RUNNER.pf.equity(prices_a))
+            DB.set_meta(f"day_anchor:{utc_now().date()}:swap",
+                        str(SWAP_RUNNER.pf.equity(prices_a)))
+    except Exception:
+        pass
+
+TradingBotV2._cycle = _cycle40
+if "TradingBotV3" in dir():
+    TradingBotV3._cycle = _cycle40
+LOG.info("[40.3] Gün anchor'ı her döngü meta'ya yazılıyor (restart-güvenli).")
+
+# ---- 40.4 dolum yoksa iptal denemesi ----
+_orig_afill40 = ExecutionEngineV2._await_fill
+
+def _afill40(self, rec, tries=5, delay=1.5):
+    filled, avg, fee = _orig_afill40(self, rec, tries, delay)
+    try:
+        if rec.amount and filled and filled < rec.amount and self.pf.mode == "live":
+            LOG.warning("[40.4][%s] KISMİ DOLUM %.1f%% — kalan emir iptal deneniyor.",
+                        rec.symbol, (filled / rec.amount) * 100)
+            try:
+                self.adapter.cancel_order(rec.order_id, rec.symbol)
+                LOG.info("[40.4][%s] kalan emir iptal edildi (id=%s).", rec.symbol, rec.order_id)
+            except TradingSystemError as e:
+                LOG.warning("[40.4] iptal başarısız (belki zaten dolmuş): %s", e)
+    except Exception:
+        pass
+    return filled, avg, fee
+
+ExecutionEngineV2._await_fill = _afill40
+LOG.info("[40.4] Partial-fill iptal koruması AKTİF (yalnız canlı yolunda etkin).")
+
+print("[BÖLÜM 40] TAMAM — cancel_order + vadeli constraints + anchor kalıcı + iptal koruması.")
 if __name__ == "__main__":
     main()
