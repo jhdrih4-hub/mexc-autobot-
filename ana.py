@@ -6147,6 +6147,84 @@ def _step_reg43(self, symbol, snap, signals, weights, regime, sent, prices_spot,
 
 SwapEngineRunner.step = _step_reg43
 print("[BÖLÜM 43] AKTİF — genişletilmiş rejim + BTC şok koruması + "
-      "dinamik risk skaleri (yalnız azaltan) + tek nokta anchor.")    
+      "dinamik risk skaleri (yalnız azaltan) + tek nokta anchor.")
+# ============================================================
+# BÖLÜM 44 — GÜNLÜK KİLİT SÜRE DÜZELTMESİ
+# Kök neden: lockout anahtarı tarihe bağlı; kilit açılma zamanı
+# kontrolü yoktu → dünkü kilit bugün de sürüyordu.
+# Çözüm: kilit yazılırken AÇILIŞ ZAMANI (expire_ts) da saklanır;
+# _lockout_flag şimdi hem bayrağı hem süreyi kontrol eder.
+# Eski format anahtarlar otomatik uyumlu hale getirilir.
+# UTC günü değişince anahtar zaten yeni tarihe geçer → çifte koruma.
+# ============================================================
+print("[BÖLÜM 44] Günlük kilit süre düzeltmesi yükleniyor...")
+
+import types as _types44
+
+LOCKOUT_DURATION_SEC44 = 4 * 3600.0   # kilit 4 saat geçerli (0.25 gün)
+
+def _lockout_key44(self, engine_tag):
+    return f"lockout:{engine_tag}:{utc_now().date()}"
+
+def _lockout_flag44(self):
+    """Yeni mantık: kilit bayrağı + SON KULLANMA süresi birlikte kontrol.
+    Eski format (yalnız '1') uyumluluk için kabul edilir ama süre kontrolü
+    meta'daki yazım zamanı ile sınırlanır."""
+    key = self._lockout_key44("swap")
+    raw = str(self.db.get_meta(key, "") or "")
+    if raw != "1":
+        return False
+    # expire zamanı meta'da ayrı saklanır
+    exp_key = f"lockout:swap:expire:{utc_now().date()}"
+    exp = safe_float(self.db.get_meta(exp_key))
+    if exp is None:
+        # Eski format → dünkü kilit olabilir; bugün yazıldıysa yazım anından
+        # itibaren 4 saat geçerli kabul edilir; bugün yazılmamışsa temizle
+        try:
+            ts_first = safe_float(
+                self.db._exec("SELECT ts FROM meta WHERE k=? LIMIT 1", (key,)).fetchone()[0]
+                if self.db._exec("SELECT EXISTS(SELECT 1 FROM meta WHERE k=?)",
+                                 (key,)).fetchone()[0] else None)
+        except Exception:
+            ts_first = None
+        now = time.time()
+        if ts_first and (now - ts_first) < LOCKOUT_DURATION_SEC44:
+            self.db.set_meta(exp_key, str(now + LOCKOUT_DURATION_SEC44))
+            return True
+        # süresi dolmuş → kilit temizle (kural korundu, süre dolmuş)
+        self.db.set_meta(key, "0")
+        LOG.info("[44] Süresi dolan günlük kilit temizlendi (%s).", key)
+        return False
+    if time.time() < exp:
+        return True
+    self.db.set_meta(key, "0")
+    LOG.info("[44] Süresi dolan günlük kilit temizlendi (%s).", key)
+    return False
+
+def _enter_daily_lockout44(self, portfolio):
+    key = self._lockout_key44("swap")
+    self.db.set_meta(key, "1")
+    exp_key = f"lockout:swap:expire:{utc_now().date()}"
+    self.db.set_meta(exp_key, str(time.time() + LOCKOUT_DURATION_SEC44))
+    LOG.warning("[44] SWAP kilit 4 saat için aktif (expire=%s).",
+                time.strftime("%H:%M UTC", time.gmtime(time.time() + LOCKOUT_DURATION_SEC44)))
+    TG.send("🔒 [SWAP-RİSK] Günlük zarar limiti — vadeli girişler 4 saat kilitli.", "risk", force=True)
+
+# SwapRiskManager'a bound-method bağla (40B.1 hatasının tekrarı olmasın)
+SWAP_RISK._lockout_flag = _types44.MethodType(_lockout_flag44, SWAP_RISK)
+SWAP_RISK._enter_daily_lockout = _types44.MethodType(_enter_daily_lockout44, SWAP_RISK)
+SWAP_RISK._lockout_key44 = _types44.MethodType(_lockout_key44, SWAP_RISK)
+
+# bugünün kilidi hâlâ geçerliyse (dünkü yazım + 4 saat içinde)expire yenile;
+# değilse temizle
+try:
+    if SWAP_RISK._lockout_flag():
+        LOG.info("[44] Bugünün kilidi 4 saat penceresi içinde — geçerli.")
+    else:
+        LOG.info("[44] Bugün kilit yok veya süresi dolmuş — vadeli girişler serbest.")
+except Exception as e:
+    LOG.warning("[44] kontrol: %s", e)
+
+print("[BÖLÜM 44] TAMAM — kilit artık süreli; UTC günü değişince otomatik sıfırlanır.")
 if __name__ == "__main__":
     main()
