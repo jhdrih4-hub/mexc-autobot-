@@ -5577,5 +5577,52 @@ except Exception as e:
     LOG.debug("[38.4] temizlik: %s", e)
 
 print("[BÖLÜM 38] TAMAM — anchor doğru, kilit şeffaf, fırsat ölçülüyor, temizlik aktif.")
+# ============================================================
+# BÖLÜM 39 — 37.2 düzeltmesi: adapter yolu + savunmacı sarmalama
+# Hata: SwapEngineRunner'da .adapter yok → .execution.adapter olmalı.
+# Çözüm: 37 wrapper'ı bypass edilir, funding kontrolü DOĞRU yolla
+# yeniden yazılır; OB duvar (37.1) etkilenmez (_pre37'de yaşıyor).
+# ============================================================
+print("[BÖLÜM 39] 37.2 adapter düzeltmesi yükleniyor...")
+
+_orig_swap_step39 = _orig_swap_step37   # B37'nin yakaladığı orijinal zincir
+
+def _swap_step39(self, symbol, snap, signals, weights, regime, sent,
+                 prices_spot, ind=None):
+    # Funding filtresi (yalnız yeni giriş + backtest dışı)
+    pos = self.pf.positions.get(symbol) if self.pf else None
+    if pos is None and self.execution and CONFIG.mode != TradingMode.BACKTEST:
+        try:
+            fr = self.execution.adapter.fetch_funding_rate(spot_to_swap(symbol))
+            rate_pct = safe_float(fr.get("fundingRate"), 0.0)
+            if rate_pct is not None:
+                rate_pct *= 100.0
+                tot = 0.0
+                for s in signals:
+                    if s.direction == "long":
+                        tot += 1.0
+                    elif s.direction == "short":
+                        tot -= 1.0
+                if tot > 0 and rate_pct > FUNDING_BLOCK_PCT:
+                    LOG.info("[39][%s] vadeli LONG engellendi: funding %+.3f%% > %.2f%%",
+                             symbol, rate_pct, FUNDING_BLOCK_PCT)
+                    return
+                if tot < 0 and rate_pct < -FUNDING_BLOCK_PCT:
+                    LOG.info("[39][%s] vadeli SHORT engellendi: funding %+.3f%%",
+                             symbol, rate_pct)
+                    return
+        except FeatureNotSupportedError:
+            pass
+        except Exception as e:
+            LOG.debug("[39] funding sorgusu (giriş engellenmedi, atlandı): %s", e)
+    return _orig_swap_step39(self, symbol, snap, signals, weights, regime, sent,
+                             prices_spot, ind)
+
+# isim-gölgeleme koruması (kuralımız): sarmalayıcı ≠ orijinal
+assert _swap_step39.__name__ != _orig_swap_step39.__name__, "[39] isim çakışması!"
+SwapEngineRunner.step = _swap_step39
+LOG.info("[39] Funding filtresi DÜZELTİLDİ (yol: execution.adapter) ve zincire bağlandı.")
+
+print("[BÖLÜM 39] TAMAM — vadeli motor sağlıklı, funding filtresi doğru yolda.")
 if __name__ == "__main__":
     main()
