@@ -1,0 +1,27 @@
+import time
+import pytest
+import ana
+
+def test_cancel_order_method_exists():
+    assert hasattr(ana.CcxtAdapter, "cancel_order")
+
+def test_set_leverage_method_exists():
+    assert hasattr(ana.CcxtAdapter, "set_leverage")   # 32C.1'den beri
+
+def test_futures_portfolio_paper_mode_forces_paper():
+    pf = ana.FuturesPortfolio("paper-swap", 4000.0, 0.001, 5.0)
+    assert pf.mode == "paper"          # 32E.1 normalizasyonu
+    assert pf.swap_tag == "paper-swap"
+
+def test_day_anchor_persists():
+    k = f"day_anchor:{ana.utc_now().date()}:swap"
+    ana.DB.set_meta(k, "3950.5")
+    v = float(ana.DB.get_meta(k))
+    assert v == 3950.5
+    ana.DB.set_meta(k, "0")
+
+def test_short_position_math():
+    pf = ana.FuturesPortfolio("paper-swap", 4000.0, 0.001, 5.0)
+    pf.open_short("A/USDT", 2.0, 100.0, 0.2, 102.0, 98.0, "t", time.time(), 3)
+    tr = pf.close_futures("A/USDT", 98.0, 0.1, "tp", time.time())
+    assert tr.net_pnl == pytest.approx((100.0 - 98.0) * 2.0 - 0.3, abs=1e-6)
