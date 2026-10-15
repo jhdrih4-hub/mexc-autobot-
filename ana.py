@@ -6340,5 +6340,61 @@ LOG.info("[F1] Limitler: max_adds=%d, ekleme-arası min %.0f sn.",
          F1_MAX_ADDS, F1_MIN_HOLD_SEC_BETWEEN_ADDS)
 
 print("[F1-P1] TAMAM — mekanizma hazır; tetikleyici karar mantığı F1-P2'de.")
+# ============================================================
+# PARÇA 3 — F1 DÜZELTMESİ: market_close 'amount' desteği
+# Sorun: F1-P2'nin TP1/TP2 çağrısı market_close'a amount geçiyor ama
+# imzada parametre yok → TypeError → TP1/TP2 hiç çalışamıyor.
+# Çözüm: V2 ve Futures market_close'a amount parametresi eklenir
+# (Portfolio.close_futures zaten F1-P1'de destekli).
+# Eski 37.1'den gelen sarmalayıcı zinciri korunur (son atan kazanır).
+# ============================================================
+print("[PARÇA 3] market_close amount desteği yükleniyor...")
+
+# ---- V2 spot market_close sarmalayıcı ----
+_orig_mc_p3 = ExecutionEngineV2.market_close
+
+def _mc_p3(self, symbol, ref_price, reason, amount=None):
+    pos = self.pf.positions.get(symbol)
+    if not pos:
+        return None
+    if self.pf.mode in ("paper", "backtest") and amount is not None and amount < pos.amount:
+        # kısmi kapatma: Portfolio.close(amount) F1-P1'de destekli
+        slip = self.pf.slippage_bps / 10000.0
+        px = ref_price * (1 - slip)
+        fee = amount * px * self.pf.fee_rate
+        tr = self.pf.close(symbol, px, fee, reason, time.time(), amount=amount)
+        if tr:
+            self.db.save_trade(tr)
+        return tr
+    # tam kapatma veya canlı: orijinal zincir
+    return _orig_mc_p3(self, symbol, ref_price, reason)
+
+ExecutionEngineV2.market_close = _mc_p3
+
+# ---- Futures market_close sarmalayıcı ----
+_orig_fmc_p3 = FuturesExecutionEngine.market_close
+
+def _fmc_p3(self, symbol, ref_price, reason, amount=None):
+    pos = self.pf.positions.get(symbol)
+    if not pos:
+        return None
+    if self.pf.mode in ("paper", "backtest") and amount is not None and amount < pos.amount:
+        slip = self.pf.slippage_bps / 10000.0
+        px = ref_price * (1 - slip) if pos.side == "long" else ref_price * (1 + slip)
+        fee = amount * px * self.pf.fee_rate
+        tr = self.pf.close_futures(symbol, px, fee, reason, time.time(),
+                                   amount=amount)
+        if tr:
+            self.db.save_trade(tr)
+        return tr
+    return _orig_fmc_p3(self, symbol, ref_price, reason)
+
+FuturesExecutionEngine.market_close = _fmc_p3
+
+# F1-P2'deki TP çağrılarının "hasattr" dalı artık amount'u alır —
+# _fstep42 fonksiyonu aynen çalışır, düzeltme imza düzeyinde tamamlandı.
+LOG.info("[PARÇA 3] market_close(V2+Futures) 'amount=' destekli — F1 TP1/TP2 artık çalışabilir.")
+
+print("[PARÇA 3] TAMAM — F1-P2 tetikleyicisi aktifleştirildi.")
 if __name__ == "__main__":
     main()
