@@ -6396,5 +6396,120 @@ FuturesExecutionEngine.market_close = _fmc_p3
 LOG.info("[PARÇA 3] market_close(V2+Futures) 'amount=' destekli — F1 TP1/TP2 artık çalışabilir.")
 
 print("[PARÇA 3] TAMAM — F1-P2 tetikleyicisi aktifleştirildi.")
+# ============================================================
+# BÖLÜM 45 — FIBONACCI + PIVOT + VOLUME PROFILE KAPILARI
+# 45.1 Fibonacci (otomatik swing): son 100 mumun tepe/dibinden
+#      0.382/0.5/0.618/0.786 seviyeleri. Fiyat 0.618 altına
+#      0.25×ATR'den fazla düştüyse ALIŞ engellenir (altın destek kırıldı).
+# 45.2 Günlük Pivot: önceki 24×1h mumdan H/L/C → P/S1/R1.
+#      Fiyat Pivot'un 0.5×ATR altındaysa ALIŞ engellenir.
+# 45.3 Volume Profile POC: 96 mum, 12 fiyat kovası, hacim-ağırlıklı
+#      POC fiyatı. Fiyat POC altına yeni kırıldıysa ALIŞ engellenir.
+# Kapsam: yalnız ALIŞ kapısı (SHORT tarafı kanıtlanmış kâr üretiyor,
+# dokunulmadı). Tüm hatalar sessiz-atlanır (bot çökmez). Backtest etkilenmez.
+# ============================================================
+print("[BÖLÜM 45] Fibonacci + Pivot + Volume Profile katmanı yükleniyor...")
+
+FIB_LOOKBACK = int(safe_float(os.environ.get("FIB_LOOKBACK"), 100) or 100)
+FIB_BREAK_ATR = safe_float(os.environ.get("FIB_BREAK_ATR"), 0.25) or 0.25
+PIVOT_BREAK_ATR = safe_float(os.environ.get("PIVOT_BREAK_ATR"), 0.5) or 0.5
+VP_BINS = 12
+
+# ---- 45.1 Fibonacci (otomatik swing — tepe/dip seçimi kural-temelli) ----
+def _fib_levels45(symbol):
+    try:
+        df = _analysis_ohlcv34(symbol, CONFIG.primary_timeframe, FIB_LOOKBACK)
+        if df is None or len(df) < 50:
+            return None
+        hi = float(df["high"].tail(FIB_LOOKBACK).max())
+        lo = float(df["low"].tail(FIB_LOOKBACK).min())
+        if hi <= lo or hi <= 0:
+            return None
+        diff = hi - lo
+        lvl = {r: lo + diff * r for r in (0.382, 0.5, 0.618, 0.786)}
+        lvl["high"], lvl["low"] = hi, lo
+        return lvl
+    except TradingSystemError:
+        return None
+
+# ---- 45.2 Günlük Pivot (önceki günün H/L/C) ----
+def _pivot_daily45(symbol):
+    try:
+        df = _analysis_ohlcv34(symbol, "1h", 26)
+        if df is None or len(df) < 25:
+            return None
+        d = df.tail(24)
+        H = float(d["high"].max())
+        L = float(d["low"].min())
+        C = float(d["close"].iloc[-1])
+        P = (H + L + C) / 3.0
+        return {"P": P, "S1": 2 * P - H, "R1": 2 * P - L}
+    except TradingSystemError:
+        return None
+
+# ---- 45.3 Volume Profile POC (fiyat kovaları + hacim) ----
+def _vp_poc45(symbol):
+    try:
+        df = _analysis_ohlcv34(symbol, CONFIG.primary_timeframe, 100)
+        if df is None or len(df) < 50:
+            return None
+        lo = float(df["low"].min())
+        hi = float(df["high"].max())
+        if hi <= lo:
+            return None
+        step = (hi - lo) / VP_BINS
+        vols = [0.0] * VP_BINS
+        for _, r in df.tail(96).iterrows():
+            mid = (float(r["high"]) + float(r["low"])) / 2.0
+            idx = int(clamp((mid - lo) / step, 0, VP_BINS - 1))
+            vols[idx] += float(r["volume"])
+        poc_idx = int(np.argmax(vols))
+        return {"poc": lo + step * (poc_idx + 0.5), "step": step}
+    except TradingSystemError:
+        return None
+
+# ---- 45.4 ALIŞ kapısı sarmalayıcı ----
+_orig_pre45 = RISK.pre_trade_checks
+
+def _pre45(symbol, snapshot, ind, portfolio, prices):
+    ok, reasons = _orig_pre45(symbol, snapshot, ind, portfolio, prices)
+    if not ok or CONFIG.mode == TradingMode.BACKTEST:
+        return ok, reasons
+    try:
+        px = safe_float(snapshot.get("last"))
+        a = safe_float(ind.get("atr"))
+        if not _ok(px) or not _ok(a) or a <= 0:
+            return ok, reasons
+        # --- Fibonacci: altın destek (0.618) kırılımı ---
+        fib = _fib_levels45(symbol)
+        if fib is not None:
+            golden = fib[0.618]
+            if px < golden - FIB_BREAK_ATR * a:
+                reasons.append(f"[45] Fib 0.618 kırıldı ({px:.4f}<{golden:.4f}) — ALIŞ engellendi")
+                ok = False
+        # --- Günlük Pivot: P altında sert kayıp ---
+        piv = _pivot_daily45(symbol)
+        if ok and piv is not None and px < piv["P"] - PIVOT_BREAK_ATR * a:
+            reasons.append(f"[45] Günlük Pivot altı ({px:.4f}<{piv['P']:.4f}) — ALIŞ engellendi")
+            ok = False
+        # --- Volume Profile: POC altına yeni kırılım ---
+        vp = _vp_poc45(symbol)
+        if ok and vp is not None and px < vp["poc"] - FIB_BREAK_ATR * a:
+            reasons.append(f"[45] POC altı ({px:.4f}<{vp['poc']:.4f}) — ALIŞ engellendi")
+            ok = False
+        # --- Yakın fib desteği = pozitif bilgi (engellemez, loglar) ---
+        if fib is not None:
+            near = min(abs(px - fib[r]) for r in (0.382, 0.5, 0.618))
+            if near <= FIB_NEAR_ATR * a:
+                LOG.info("[45][%s] Fib desteğine yakın (%s mesafede) — pozitif konfluans.",
+                         symbol, fmt_money(near))
+    except Exception as e:
+        LOG.debug("[45] kapı: %s", e)
+    return ok, reasons
+
+RISK.pre_trade_checks = _pre45
+LOG.info("[45] Fib/Pivot/POC ALIŞ kapıları AKTİF (kırılım eşiği: %.2f×ATR).", FIB_BREAK_ATR)
+
+print("[BÖLÜM 45] TAMAM — Fibonacci + Pivot + Volume Profile ALIŞ kapıları canlı.")
 if __name__ == "__main__":
     main()
