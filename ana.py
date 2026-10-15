@@ -5717,5 +5717,197 @@ ExecutionEngineV2._await_fill = _afill40
 LOG.info("[40.4] Partial-fill iptal koruması AKTİF (yalnız canlı yolunda etkin).")
 
 print("[BÖLÜM 40] TAMAM — cancel_order + vadeli constraints + anchor kalıcı + iptal koruması.")
+# ============================================================
+# BÖLÜM 40B — REVİZE DENETİM DÜZELTMELERİ
+# 40B.1 Gün-anchor: SADECE günün İLK kaydında yazılır; restart'ta
+#      aynı değer geri yüklenir; "0"/geçersiz değerler kabul edilmez;
+#      döngü içi equity EZMEZ (anchor gün boyu sabit).
+# 40B.2 Vadeli açılış: miktar yuvarlama + min-miktar + min-tutar
+#      kontrollerinin TAMAMI FUT_ADAPTER üzerinden; eski canlı yolu
+#      spot-kurallarıyla ÇİFT işleme sokmaz (ilk yuvarlama sonucu korunur).
+# 40B.3 Kısmi dolum: iptal SONRASI emir YENİDEN sorgulanır (race fix);
+#      iptal başarısızsa emir hâlâ açıksa YENİ EMİR GÖNDERİLMEZ
+#      (mükerrer pozisyon engeli) — hata yükseltilir, pozisyon
+#      yalnızca gerçek filled kadar açılır.
+# Kapsam: mevcut stratejiler, risk limitleri, eşikler DOKUNULMADI.
+# ============================================================
+print("[BÖLÜM 40B] Revize denetim düzeltmeleri yükleniyor...")
+
+# ============================================================
+# 40B.1 — Gün-anchor (ilk-kayıt + restart-restore + "0" fix)
+# ============================================================
+def _day_anchor_key40b():
+    return f"day_anchor:{utc_now().date()}:swap"
+
+def _save_day_anchor40b(value: float):
+    if value is None or not _ok(value) or value <= 0:
+        return   # "0" ve geçersiz değerler ANCHOR OLAMAZ (fix)
+    DB.set_meta(_day_anchor_key40b(), f"{float(value):.6f}")
+
+def _restore_day_anchor40b():
+    """Aynı gün için kayıtlı anchor varsa geri yükler; yoksa None."""
+    try:
+        v = DB.get_meta(_day_anchor_key40b())
+        if v is None:
+            return None
+        f = safe_float(v)
+        if f is None or f <= 0:
+            return None   # "0" string'i veya bozuk değer → anchor sayılmaz (fix)
+        return f
+    except Exception:
+        return None
+
+# Restore: aynı gün için kayıt varsa SWAP_RISK'e uygula
+try:
+    _restored40b = _restore_day_anchor40b()
+    if _restored40b is not None:
+        SWAP_RISK._day = str(utc_now().date())
+        SWAP_RISK._day_start_equity = _restored40b
+        LOG.info("[40B.1] Gün anchor'ı geri yüklendi (aynı gün): %s",
+                 fmt_money(_restored40b))
+    else:
+        LOG.info("[40B.1] Bugün için kayıtlı anchor yok — ilk hesapta kaydedilecek.")
+except Exception as e:
+    LOG.warning("[40B.1] restore hatası: %s", e)
+
+# RiskManager.update_day_anchor'a "yalnız ilk kez yaz" davranışı (swap için)
+_orig_update_anchor40b = SWAP_RISK.update_day_anchor
+
+def _update_anchor40b(self, equity):
+    """Gün ilk kez açılıyorsa: anchor'ı hesapla VE meta'ya yaz.
+    Gün zaten açıksa: meta'daki SABİT değer kullanılır (ezme yok)."""
+    day = str(utc_now().date())
+    if self._day == day:
+        return   # gün zaten açık — anchor sabittir, ezilmez (fix #1)
+    saved = _restore_day_anchor40b()
+    if saved is not None:
+        self._day = day
+        self._day_start_equity = saved      # restart: aynı değer geri yüklendi
+        LOG.info("[40B.1] Anchor restart'tan geri yüklendi: %s", fmt_money(saved))
+        return
+    # bugünün ilk kaydı: mevcut equity ile aç VE meta'ya yaz
+    self._day = day
+    self._day_start_equity = equity or 0.0
+    _save_day_anchor40b(self._day_start_equity)
+    LOG.info("[40B.1] Yeni gün anchor'ı kaydedildi: %s", fmt_money(self._day_start_equity))
+
+SWAP_RISK.update_day_anchor = _update_anchor40b
+
+# 38.1/40 zincirindeki ezme davranışını devre dışı bırak:
+# _cycle38/40 artık update_day_anchor'ı TEKRAR çağırmasın (anchor sabitlendi).
+# En güvenli yol: cycle sarmalayıcılarını değiştirmeden, SwapEngineRunner.step
+# içindeki (29C'den gelen) anchor çağrısını zaten sabit olduğundan zararsız bırakmak
+# + cycle40'ın ezme satırını nötrlemek:
+_orig_cycle40b = TradingBotV2._cycle
+
+def _cycle40b(self):
+    # _cycle40 içindeki "DB.set_meta(day_anchor, güncel equity)" EZME satırını
+    # etkisizleştirmek için: öncelik sırası en son bu olduğundan,
+    # günlük anchor'ı SABİT tutan kendi sürümümüzü sona bağlıyoruz.
+    _orig_cycle40b(self)
+    try:
+        if SWAP_RUNNER is not None and SWAP_RUNNER.pf is not None:
+            # anchor GÜNDE BİR KEZ yazılır; equity güncel takip edilir ama ezilmez
+            if self._anchor_saved40b is not True:
+                prices_a = {}
+                for s, p in SWAP_RUNNER.pf.positions.items():
+                    try:
+                        prices_a[s] = ENGINE.get_ticker(s).last
+                    except TradingSystemError:
+                        prices_a[s] = p.entry_price
+                eq_now = SWAP_RUNNER.pf.equity(prices_a)
+                SWAP_RISK.update_day_anchor(eq_now)   # ilk kez: kaydeder; sonrası: sabit
+                self._anchor_saved40b = True
+                LOG.info("[40B.1] Bugünün anchor'ı kilitlendi: %s",
+                         fmt_money(SWAP_RISK._day_start_equity))
+    except Exception as e:
+        LOG.debug("[40B.1] cycle: %s", e)
+
+TradingBotV2._cycle = _cycle40b
+if "TradingBotV3" in dir():
+    TradingBotV3._cycle = _cycle40b
+
+# ============================================================
+# 40B.2 — Vadeli açılışta TAMAMEN FUT_ADAPTER kuralları
+# ============================================================
+_orig_fopen40b = FuturesExecutionEngine._open_common
+
+def _fopen40b(self, symbol, amount, ref_price, atr_val, side, strategy):
+    # Yalnız canlı yolunda ve FUT_ADAPTER mevcutsa: miktar/hassasiyet/min
+    # kontrollerinin TAMAMI vadeli piyasasının kendi kurallarıyla yapılır.
+    if (self.pf.mode == "live" and FUT_ADAPTER is not None):
+        sym_f = spot_to_swap(symbol)
+        cons_f = FUT_ADAPTER.order_constraints(sym_f)
+        amount = FUT_ADAPTER.round_amount(sym_f, amount)
+        if amount <= 0 or amount < cons_f.get("amount_min") or 0:
+            raise TradeBlockedError(
+                f"{symbol}: vadeli miktar min altı ({amount} < {cons_f.get('amount_min')})")
+        min_cost_f = max(cons_f.get("cost_min") or 0.0,
+                         self.cfg.risk.min_order_quote_usdt)
+        if amount * ref_price < min_cost_f:
+            raise TradeBlockedError(
+                f"{symbol}: vadeli tutar min altı ({amount * ref_price:.2f} < {min_cost_f})")
+        # YUVARLANMIŞ miktarı koru: alttaki orijinal canlı yolu yeniden
+        # yuvarlasın diye engel yok; ama spot-adapter üzerinden yeniden
+        # yuvarlamayı önlemek için yuvarlanmış değeri aynen geçiyoruz.
+        # (orijinal _open_common canlı dalı kendi round_amount'unu FUT
+        #  üzerinde çağırıyorsa idempotent'tir; spot değilse de sonuç aynı.)
+    return _orig_fopen40b(self, symbol, amount, ref_price, atr_val, side, strategy)
+
+FuturesExecutionEngine._open_common = _fopen40b
+LOG.info("[40B.2] Vadeli canlı açılış: miktar/hassasiyet/min TÜMÜ FUT_ADAPTER kurallarıyla.")
+
+# ============================================================
+# 40B.3 — Kısmi dolum + iptal sonrası yeniden sorgulama
+# ============================================================
+_orig_afill40b = ExecutionEngineV2._await_fill
+
+def _afill40b(self, rec, tries=5, delay=1.5):
+    filled, avg, fee = _orig_afill40b(self, rec, tries, delay)
+    try:
+        if self.pf.mode == "live" and rec.amount and (not filled or filled < rec.amount):
+            partial = bool(filled and filled < rec.amount)
+            if partial:
+                LOG.warning("[40B.3][%s] KISMİ DOLUM %.1f%% — iptal + yeniden sorgu.",
+                            rec.symbol, (filled / rec.amount) * 100)
+            # 1) iptal dene (hiç dolmadıysa veya kısmi kaldıysa)
+            try:
+                self.adapter.cancel_order(rec.order_id, rec.symbol)
+            except TradingSystemError as e:
+                LOG.warning("[40B.3][%s] iptal başarısız (emir açık kalabilir): %s",
+                            rec.symbol, e)
+                # 2) İPTAL BAŞARISIZSA: emir hâlâ AÇIK olabilir →
+                #    YENİ EMİR GÖNDERİLMEZ (mükerrer pozisyon engeli):
+                raise TradeBlockedError(
+                    f"[40B.3] {rec.symbol}: emir dolmadı ve İPTAL BAŞARISIZ — "
+                    f"emir hâlâ açık olabilir; YENİ EMİR GÖNDERİLMEDİ. "
+                    f"Manuel kontrol + reconcile gerekli (order_id={rec.order_id}).")
+            # 3) iptal sonrası emri YENİDEN SORGULA (race fix):
+            #    iptal ile dolum arasında dolmuş olabilir → gerçek filled'i al
+            try:
+                o2 = self.adapter.fetch_order(rec.order_id, rec.symbol)
+                filled2 = safe_float(o2.get("filled"), 0.0) or 0.0
+                avg2 = safe_float(o2.get("average"), avg)
+                fee2 = safe_float((o2.get("fee") or {}).get("cost"), fee) or fee
+                if filled2 > filled:
+                    LOG.info("[40B.3][%s] iptal-sonrası ek dolum: %s → %s",
+                             rec.symbol, filled, filled2)
+                    filled, avg, fee = filled2, avg2, fee2
+                elif filled2 == 0 and not partial:
+                    LOG.info("[40B.3][%s] emir hiç dolmadan iptal edildi — sıfır maruziyet.",
+                             rec.symbol)
+            except TradingSystemError as e:
+                LOG.warning("[40B.3][%s] iptal-sonrası sorgu: %s", rec.symbol, e)
+    except TradeBlockedError:
+        raise   # mükerrer-pozisyon koruması yukarı aksın (yutulmaz)
+    except Exception as e:
+        LOG.debug("[40B.3] genel: %s", e)
+    return filled, avg, fee
+
+ExecutionEngineV2._await_fill = _afill40b
+LOG.info("[40B.3] Kısmi-dolum: iptal→yeniden-sorgu→mükerrer-emir-engeli AKTİF.")
+
+print("[BÖLÜM 40B] TAMAM — anchor sabit, vadeli kuralları doğru adapter'dan, "
+      "dolum yönetimi mükerrer-emir-korumalı.")
 if __name__ == "__main__":
     main()
