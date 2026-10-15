@@ -5909,5 +5909,56 @@ LOG.info("[40B.3] Kısmi-dolum: iptal→yeniden-sorgu→mükerrer-emir-engeli AK
 
 print("[BÖLÜM 40B] TAMAM — anchor sabit, vadeli kuralları doğru adapter'dan, "
       "dolum yönetimi mükerrer-emir-korumalı.")
+# ============================================================
+# BÖLÜM 41 — 40B anchor fix: MethodType bağlaması
+# Hata: self'li fonksiyon instance'a atanınca bound-method olmuyor →
+# TypeError sessizce yutuluyor → anchor hiç yazılamıyordu (0.00).
+# Fix: types.MethodType ile instance'a bağlanır; ayrıca çağrı
+# başarısızsa sessiz yutma yerine log atılır (görünürlük kuralı).
+# ============================================================
+print("[BÖLÜM 41] Anchor MethodType fix yükleniyor...")
+import types as _types41
+
+# 40B'nin kırık instance-atalamasını temizle (class method'a dön)
+try:
+    del SWAP_RISK.update_day_anchor
+except AttributeError:
+    pass
+
+def _update_anchor41(self, equity):
+    """Gün ilk açılışta anchor'ı meta'ya yazar; restart'ta geri yükler;
+    aynı gün içinde EZMEZ. ('0'/geçersiz değerler anchor sayılmaz.)"""
+    day = str(utc_now().date())
+    if self._day == day:
+        return   # gün açık — anchor sabit
+    saved = _restore_day_anchor40b()
+    if saved is not None:
+        self._day = day
+        self._day_start_equity = saved
+        LOG.info("[41] Anchor restart'tan geri yüklendi: %s", fmt_money(saved))
+        return
+    if not _ok(equity) or equity <= 0:
+        LOG.warning("[41] Anchor yazılmadı: geçersiz equity (%s)", equity)
+        return
+    self._day = day
+    self._day_start_equity = float(equity)
+    _save_day_anchor40b(self._day_start_equity)
+    LOG.info("[41] Yeni gün anchor'ı yazıldı: %s", fmt_money(self._day_start_equity))
+
+# KRİTİK FİX: instance'a MethodType ile bağla (self otomatik gelir)
+SWAP_RISK.update_day_anchor = _types41.MethodType(_update_anchor41, SWAP_RISK)
+
+# doğrulama: çağrı artık çalışmalı (ilk gün kaydı)
+try:
+    SWAP_RISK.update_day_anchor(3903.79)
+    assert _ok(SWAP_RISK._day_start_equity) and SWAP_RISK._day_start_equity > 0, \
+        "anchor hâlâ 0 — bağlama başarısız!"
+    LOG.info("[41] Doğrulama OK: anchor=%s (gün=%s)",
+             fmt_money(SWAP_RISK._day_start_equity), SWAP_RISK._day)
+except Exception as e:
+    LOG.error("[41] Doğrulama BAŞARISIZ: %s", e)
+    raise
+
+print("[BÖLÜM 41] TAMAM — anchor artık gerçekten yazılıyor (MethodType fix).")
 if __name__ == "__main__":
     main()
