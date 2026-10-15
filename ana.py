@@ -5332,5 +5332,147 @@ else:
 
 print("[BÖLÜM 36] TAMAM — minimum tutma %.0f sn + kapatma eşiği −%.2f."
       % (MIN_HOLD_SECONDS, CONFIG.sell_score_threshold - CLOSE_SCORE_MARGIN))
+# ============================================================
+# BÖLÜM 37 — AKILLI FİLTRE ÜÇLÜSÜ (Gemini önerilerinden süzülenler)
+# 37.1 Order-book duvar filtresi: bid_imbalance verisi zaten
+#      hesaplanıyordu ama karar KULLANILMIYORDU → şimdi kullanılır.
+#      bid_imbalance < 0.40 (satış duvarı ağır) → ALIŞ engellenir.
+# 37.2 Funding rate filtresi (vadeli): |funding| > 0.10% ise o YÖNDE
+#      vadeli giriş engellenir (aşırı kalabalık yön = maliyet cezası).
+# 37.3 Range rejiminde eşik yükseltme: yatay testere piyasasında
+#      ALIŞ eşiği 0.35 → 0.40 (gürültü işlemlerini azalt).
+# Hepsi paper+live aktif; backtest etkilenmez (tarihsel tutarlılık).
+# ============================================================
+print("[BÖLÜM 37] Akıllı filtre üçlüsü yükleniyor...")
+
+OB_IMBALANCE_MIN_BUY = safe_float(os.environ.get("OB_IMBALANCE_MIN_BUY"), 0.40) or 0.40
+FUNDING_BLOCK_PCT = safe_float(os.environ.get("FUNDING_BLOCK_PCT"), 0.10) or 0.10
+RANGE_THRESHOLD_BOOST = safe_float(os.environ.get("RANGE_THRESHOLD_BOOST"), 0.05) or 0.05
+
+# ---- 37.1 Order-book duvar filtresi (snapshot'tan imbalance oku) ----
+def _ob_wall_block37(symbol, snapshot):
+    """True dönerse ALIŞ engellenmeli (satış baskısı duvarı)."""
+    try:
+        if CONFIG.mode == TradingMode.BACKTEST:
+            return False
+        imb = snapshot.get("bid_imbalance")
+        if not _ok(imb):
+            return False   # veri yoksa engelleme (snapshot'ta imbalance yok olabilir)
+        return imb < OB_IMBALANCE_MIN_BUY
+    except Exception:
+        return False
+
+# snapshot'a imbalance ekleyelim (get_order_book_stats zaten üretiyor, snapshot'a taşıyalım)
+_orig_snap37 = MarketDataEngine.snapshot
+
+def _snap37(self, symbol):
+    s = _orig_snap37(self, symbol)
+    try:
+        if "bid_imbalance" not in s or not _ok(s.get("bid_imbalance")):
+            b = self._books.get(symbol)
+            if b is not None:
+                bids = b.get("bids") or []
+                asks = b.get("asks") or []
+                bid_v = sum(safe_float(x[1], 0) for x in bids[:10])
+                ask_v = sum(safe_float(x[1], 0) for x in asks[:10])
+                if (bid_v + ask_v) > 0:
+                    s["bid_imbalance"] = bid_v / (bid_v + ask_v)
+    except Exception:
+        pass
+    return s
+
+MarketDataEngine.snapshot = _snap37
+
+# ---- 37.2 Funding rate filtresi + 37.1 OB duvarı → swap kapı sarmalayıcısı ----
+_orig_swap_step37 = SwapEngineRunner.step
+
+def _wrap37_step(self, symbol, snap, signals, weights, regime, sent, prices_spot, ind=None):
+    pos = self.pf.positions.get(symbol) if self.pf else None
+    if pos is None and self.execution and CONFIG.mode != TradingMode.BACKTEST:
+        # 37.1: emir defteri duvarı (yalnız ALIŞ yönü etkilenebilir — short zaten satış)
+        try:
+            d_prev = getattr(DECISION, "_last_action_37", {}).get(symbol)
+        except Exception:
+            d_prev = None
+        # 37.2: funding oranı kontrolü (yalnız vadeli)
+        try:
+            fr = self.adapter.fetch_funding_rate(spot_to_swap(symbol))
+            rate_pct = safe_float(fr.get("fundingRate"), 0.0)
+            if rate_pct is not None:
+                rate_pct *= 100.0
+                # LONG açılacaksa ve funding yüksek pozitif (long öder) → engelle
+                # SHORT açılacaksa ve funding yüksek negatif (short öder) → engelle
+                # Yön bilgisini sinyallerden çıkarırız: toplam skor işareti
+                tot = 0.0
+                for s in signals:
+                    if s.direction == "long":
+                        tot += 1.0
+                    elif s.direction == "short":
+                        tot -= 1.0
+                if tot > 0 and rate_pct > FUNDING_BLOCK_PCT:
+                    LOG.info("[37.2][%s] vadeli LONG engellendi: funding %+.3f%% > %.2f%%",
+                             symbol, rate_pct, FUNDING_BLOCK_PCT)
+                    TG.send(f"[37.2][{symbol}] LONG engellendi: funding {rate_pct:+.3f}%",
+                            "risk")
+                    return
+                if tot < 0 and rate_pct < -FUNDING_BLOCK_PCT:
+                    LOG.info("[37.2][%s] vadeli SHORT engellendi: funding %+.3f%% < -%.2f%%",
+                             symbol, abs(rate_pct), FUNDING_BLOCK_PCT)
+                    TG.send(f"[37.2][{symbol}] SHORT engellendi: funding {rate_pct:+.3f}%",
+                            "risk")
+                    return
+        except FeatureNotSupportedError:
+            pass   # spot adapter'da funding yok → sessiz geç
+        except TradingSystemError as e:
+            LOG.debug("[37.2] funding sorgusu: %s", e)
+    return _orig_swap_step37(self, symbol, snap, signals, weights, regime, sent,
+                             prices_spot, ind)
+
+SwapEngineRunner.step = _wrap37_step
+LOG.info("[37.2] Funding rate filtresi AKTİF (engel eşiği: %.2f%%).", FUNDING_BLOCK_PCT)
+
+# ---- 37.3 Range rejiminde eşik yükseltme + 37.1 spot kapısı ----
+_orig_spot_ps37 = RISK.position_size
+_orig_decide37 = DECISION.decide
+_decide37_name = getattr(_orig_decide37, "__name__", "?")
+
+def _decide37(symbol, snapshot, signals, weights, sentiment, has_position, regime):
+    d = _orig_decide37(symbol, snapshot, signals, weights, sentiment,
+                       has_position, regime)
+    try:
+        if d.action == "BUY" and regime == "range":
+            strict = CONFIG.buy_score_threshold + RANGE_THRESHOLD_BOOST
+            if d.score < strict:
+                return Decision(ts=d.ts, symbol=d.symbol, action="HOLD",
+                                score=d.score, confidence=d.confidence,
+                                reasons=d.reasons + [
+                                    f"range eşiği: AL için skor≥{strict:.2f} gerekli"],
+                                regime=d.regime, data_ok=d.data_ok)
+    except Exception as e:
+        LOG.debug("[37.3] decide eki: %s", e)
+    return d
+
+if _decide37.__name__ != _decide37_name:
+    DECISION.decide = _decide37
+    LOG.info("[37.3] Range eşiği yükseltme AKTİF (range'de AL: %.2f → %.2f).",
+             CONFIG.buy_score_threshold,
+             CONFIG.buy_score_threshold + RANGE_THRESHOLD_BOOST)
+else:
+    LOG.error("[37.3] isim çakışması — bağlanmadı.")
+
+_orig_pre37 = RISK.pre_trade_checks
+
+def _pre37(symbol, snapshot, ind, portfolio, prices):
+    ok, reasons = _orig_pre37(symbol, snapshot, ind, portfolio, prices)
+    if ok and _ob_wall_block37(symbol, snapshot):
+        reasons.append(f"emir defteri duvarı: bid_imbalance<{OB_IMBALANCE_MIN_BUY} (satış baskısı)")
+        ok = False
+    return ok, reasons
+
+RISK.pre_trade_checks = _pre37
+LOG.info("[37.1] Order-book duvar filtresi AKTİF (engel: imbalance<%.2f).",
+         OB_IMBALANCE_MIN_BUY)
+
+print("[BÖLÜM 37] Akıllı filtre üçlüsü AKTİF — OB duvar + funding + range eşiği.")
 if __name__ == "__main__":
     main()
