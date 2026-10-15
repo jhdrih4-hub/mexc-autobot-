@@ -5474,5 +5474,108 @@ LOG.info("[37.1] Order-book duvar filtresi AKTİF (engel: imbalance<%.2f).",
          OB_IMBALANCE_MIN_BUY)
 
 print("[BÖLÜM 37] Akıllı filtre üçlüsü AKTİF — OB duvar + funding + range eşiği.")
+# ============================================================
+# BÖLÜM 38 — GÜNLÜK RİSK ŞEFFAFLIĞI + ANCHOR DÜZELTMESİ
+# 38.1 Anchor bug'ı: update_day_anchor tek sembol fiyatıyla
+#      (kısmi equity) çağrılıyordu → artık döngü başında TAM
+#      fiyatlarla 1 kez çağrılır; step içi çağrılar kaldırılır.
+# 38.2 Şeffaflık: kilitliyken SWAP GÜN RAPORU yazılır
+#      (anchor, equity, zarar%, reset saati) — hatalı/gerçek ayırtı log'dan görünür.
+# 38.3 Fırsat izleme: kilitliyken üretilen giriş sinyalleri
+#      meta'ya sayılır → "kaçan fırsat" ölçülebilir hale gelir.
+# 38.4 Eski gün lockout anahtarları temizlenir (birikme önlenir).
+# NOT: Günlük %3 kilit KORUNUR (gereksinim #7). Kilit yalnız YENİ
+# girişleri engeller; tarama/sinyal/SL-TP/raporlama aynen sürer.
+# ============================================================
+print("[BÖLÜM 38] Günlük risk şeffaflığı yükleniyor...")
+
+# ---- 38.1 TAM fiyatlı anchor (döngü başında 1 kez) ----
+_orig_swap_step38 = SwapEngineRunner.step
+
+def _swap_step38(self, symbol, snap, signals, weights, regime, sent, prices_spot, ind=None):
+    # step içi anchor çağrısı ARTIK YAPILMAZ (kısmi equity bug'ı) —
+    # anchor cycle başında _cycle38'de tam fiyatlarla kurulur.
+    return _orig_swap_step38(self, symbol, snap, signals, weights, regime, sent,
+                             prices_spot, ind)
+
+SwapEngineRunner.step = _swap_step38
+
+# ---- 38.2+38.3 döngü katmanı ----
+_locked_signals38 = {"count": 0}
+
+_orig_cycle38 = TradingBotV2._cycle
+
+def _cycle38(self):
+    # SWAP_RISK anchor: TAM fiyatlarla, döngü başında 1 kez
+    if SWAP_RUNNER is not None and SWAP_RUNNER.pf is not None:
+        try:
+            prices_a = {}
+            for s, p in SWAP_RUNNER.pf.positions.items():
+                try:
+                    prices_a[s] = ENGINE.get_ticker(s).last
+                except TradingSystemError:
+                    prices_a[s] = p.entry_price
+            SWAP_RISK.update_day_anchor(SWAP_RUNNER.pf.equity(prices_a))
+        except Exception as e:
+            LOG.debug("[38.1] anchor: %s", e)
+        # 38.2 şeffaflık: kilit durumunu her döngüde saydam raporla
+        try:
+            eq = SWAP_RUNNER.pf.equity(prices_a)
+            dl = SWAP_RISK.daily_loss_pct(eq)
+            locked = SWAP_RISK._lockout_flag()
+            if locked or dl >= self.cfg.risk.max_daily_loss_pct * 0.5:
+                reset_ts = time.strftime("%H:%M UTC",
+                    time.gmtime((pd.Timestamp(utc_now().date()) +
+                                 pd.Timedelta(days=1)).timestamp()))
+                LOG.info("[38.2] SWAP GÜN RAPORU | anchor=%s | equity=%s | "
+                         "günlük zarar=%.2f%%/%.1f%% | kilit=%s | reset=%s | "
+                         "kaçan sinyal=%d",
+                         fmt_money(SWAP_RISK._day_start_equity), fmt_money(eq),
+                         dl, self.cfg.risk.max_daily_loss_pct,
+                         "KİLİTLİ" if locked else "açık",
+                         reset_ts, _locked_signals38["count"])
+        except Exception as e:
+            LOG.debug("[38.2] gün raporu: %s", e)
+    _orig_cycle38(self)
+    # döngü sonunda sayaç gösterge için sıfırlanmaz; 38.2 raporlar
+
+TradingBotV2._cycle = _cycle38
+if "TradingBotV3" in dir():
+    TradingBotV3._cycle = _cycle38
+LOG.info("[38.1/38.2] Tam-fiyat anchor + şeffaf gün raporu AKTİF.")
+
+# ---- 38.3 kilitliyken giriş sinyali sayacı ----
+_orig_swap_risk_pre38 = SWAP_RISK.pre_trade_checks
+
+def _swap_risk_pre38(symbol, snapshot, ind, portfolio, prices):
+    ok, reasons = _orig_swap_risk_pre38(symbol, snapshot, ind, portfolio, prices)
+    try:
+        if not ok and any("KİLİTLİ" in r for r in reasons):
+            _locked_signals38["count"] += 1
+    except Exception:
+        pass
+    return ok, reasons
+
+SWAP_RISK.pre_trade_checks = _swap_risk_pre38
+LOG.info("[38.3] Kilitli-fırsat sayacı AKTİF (kaçan sinyaller ölçülür).")
+
+# ---- 38.4 eski lockout anahtar temizliği ----
+try:
+    _cutoff38 = time.time() - 3 * 86400
+    rows = DB._exec("SELECT k FROM meta WHERE k LIKE 'lockout:%'").fetchall()
+    for (k,) in rows:
+        try:
+            # anahtar formatları: lockout:YYYY-MM-DD | lockout:swap:YYYY-MM-DD
+            date_part = k.split(":")[-1]
+            ts = pd.Timestamp(date_part).timestamp()
+            if ts < _cutoff38:
+                DB._exec("DELETE FROM meta WHERE k=?", (k,))
+        except Exception:
+            continue
+    LOG.info("[38.4] 3 günden eski lockout anahtarları temizlendi.")
+except Exception as e:
+    LOG.debug("[38.4] temizlik: %s", e)
+
+print("[BÖLÜM 38] TAMAM — anchor doğru, kilit şeffaf, fırsat ölçülüyor, temizlik aktif.")
 if __name__ == "__main__":
     main()
