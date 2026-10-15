@@ -5991,5 +5991,158 @@ NEWS_TRUST = {
     "cryptoslate.com":    ("news_agg",    0.70),
     "mexc.com":           ("exchange_official", 0.95),
     "binance.com":
+# ============================================================
+# BÖLÜM 43 — ADAPTİF REJİM + DİNAMİK RİSK (gerçek eksikler)
+# 43.1 Genişletilmiş rejim: strong/weak trend ayrımı + kısa/orta/uzun
+#      TF özet etiketi (yalnız bilgi — işlem etkisi yok, tahmin değil).
+# 43.2 BTC-düşüş koruması: BTC 24h değişimi eşik aşarsa vadeli/spot
+#      YENİ GİRİŞ risk çarpanı düşürülür (satış üretmez, sadece
+#      pozisyon boyutu küçülür; maks. risk limitleri asla aşılmaz).
+# 43.3 Tek noktadan dinamik risk skaleri: rejim×BTC×gün-durumu çarpımı,
+#      çıktı SÜREKLİ ≤1.0; spot ve vadeli boyutlandırmaya bağlanır.
+# 43.4 Eski kısmi anchor çağrısı disable (tek nokta = cycle'daki tam
+#      fiyatlı anchor; hata yutma yerine tek-log garantisi).
+# Kapsam: mevcut motorlar, PAPER, kill switch, günlük kilit, anchor
+# sistemi DOKUNULMADI. Tüm çarpanlar yalnız AZALTAN yönde çalışır.
+# ============================================================
+print("[BÖLÜM 43] Adaptif rejim + dinamik risk yükleniyor...")
+
+import types as _types43
+
+# ---- 43.1 Genişletilmiş rejim ----
+_orig_regime43 = RegimeDetector.classify
+
+def _regime43(self, df, ind):
+    """Mevcut etiketleri koruyarak güçlü/zayıf ayrımı ekler:
+    trend_up_strong / trend_up_weak / trend_down_strong / trend_down_weak
+    (eski tüketiciler 'trend_up'/'trend_down' ile başlayanları yakalar)."""
+    r = CONFIG.risk
+    ap, ax = ind.get("atr_pct"), ind.get("adx")
+    e50, e200 = ind.get("ema50"), ind.get("ema200")
+    if not (_ok(ap) and _ok(ax) and _ok(e50)):
+        return "unknown"
+    if ap > r.max_atr_pct:
+        return "volatile"
+    if ap < r.min_atr_pct:
+        return "quiet"
+    if ax >= 25:
+        e2 = e200 if _ok(e200) else e50
+        base = "trend_up" if e50 > e2 else "trend_down"
+        strength = "strong" if ax >= 35 else "weak"
+        return f"{base}_{strength}"
+    return "range"
+
+RegimeDetector.classify = _regime43
+
+# TF-özet (bilgi amaçlı; her 20 döngüde SWAP DURUM satırına ekleme yapmayan,
+# ayrı seyrek log):
+def _tf_overview43(symbol):
+    out = {}
+    for label, tf in (("k", "15m"), ("o", "1h"), ("u", "4h")):
+        try:
+            df = _analysis_ohlcv34(symbol, tf, 60)
+            c = df["close"]
+            e = safe_float(ema(c, 21).iloc[-1])
+            out[label] = "up" if (_ok(e) and float(c.iloc[-1]) > e) else \
+                         ("dn" if _ok(e) else "?")
+        except TradingSystemError:
+            out[label] = "?"
+    return f"{out.get('k','?')}/{out.get('o','?')}/{out.get('u','?')}"
+
+# ---- 43.2+43.3 Dinamik risk skaleri (tek nokta; her zaman ≤1.0) ----
+def _dynamic_risk_scalar43(portfolio=None):
+    """Çarpanlar: rejim × BTC-şoku × gün-durumu. ASLA 1.0'ı aşamaz."""
+    s = 1.0
+    try:
+        # (a) günlük durum: gün içinde kayıp arttıkça küçül (yalnız azaltan)
+        if SWAP_RUNNER is not None and SWAP_RUNNER.pf is not None:
+            eq = SWAP_RUNNER.pf.equity({})
+            dl = SWAP_RISK.daily_loss_pct(eq)
+            if dl >= 1.5:
+                s *= 0.60      # günün yarısını kaybetti → riski %40'a düşür
+            elif dl >= 1.0:
+                s *= 0.80
+        # (b) BTC şok koruması: BTC 24h düşüşü %6+ ise altcoin riski küçül
+        try:
+            df_b = _analysis_ohlcv34("BTC/USDT", "1h", 26)
+            if len(df_b) >= 25:
+                chg24 = (float(df_b["close"].iloc[-1]) /
+                         float(df_b["close"].iloc[-24]) - 1.0) * 100.0
+                if chg24 <= -6.0:
+                    s *= 0.50
+                elif chg24 <= -3.5:
+                    s *= 0.75
+        except TradingSystemError:
+            pass
+        # (c) makro skala (zaten ≤1.0)
+        if getattr(CONFIG, "macro", None) and CONFIG.macro.enabled:
+            s *= MACRO.get_scalar("BTC/USDT")
+        # (d) volatile/unknown rejim cezası
+        if getattr(SWAP_RUNNER, "_last_regime43", None) in ("volatile", "unknown"):
+            s *= 0.70
+    except Exception as e:
+        LOG.debug("[43.3] skaler: %s", e)
+    return float(clamp(s, 0.10, 1.0))   # asla 1.0'ı AŞAMAZ, 0.10 altına düşmez
+
+_last_scalar_log43 = 0.0
+
+# ---- 43.3 bağlantı: SWAP boyutlandırma çarpanı ----
+_orig_psize43 = SWAP_RISK.position_size
+
+def _psize43(self, equity, price, stop_price, constraints):
+    global _last_scalar_log43
+    base_qty, why = _orig_psize43(self, equity, price, stop_price, constraints)
+    sc = _dynamic_risk_scalar43()
+    if base_qty > 0 and sc < 1.0:
+        now = time.time()
+        if now - _last_scalar_log43 > 900:   # 15 dk'da bir log (spam önleme)
+            _last_scalar_log43 = now
+            LOG.info("[43.3] dinamik risk skaleri=%.2f (boyut×skaler).", sc)
+        step = constraints.get("amount_step") or 1e-8
+        base_qty = math.floor((base_qty * sc) / step) * step
+        if base_qty <= 0:
+            return 0.0, "dinamik skalerle miktar 0"
+    return base_qty, why
+
+SWAP_RISK.position_size = _psize43
+# SPOT tarafı için de aynı çarpan (sarmalayıcı; mevcut kapılar korunur)
+_orig_psize_spot43 = RISK.position_size
+
+def _psize_spot43(self, equity, price, stop_price, constraints):
+    base_qty, why = _orig_psize_spot43(self, equity, price, stop_price, constraints)
+    sc = _dynamic_risk_scalar43()
+    if base_qty > 0 and sc < 1.0:
+        step = constraints.get("amount_step") or 1e-8
+        base_qty = math.floor((base_qty * sc) / step) * step
+        if base_qty <= 0:
+            return 0.0, "dinamik skalerle miktar 0"
+    return base_qty, why
+
+RISK.position_size = _psize_spot43
+LOG.info("[43.3] Dinamik risk skaleri spot+vadeliye bağlı (yalnız azaltan, ≤1.0).")
+
+# ---- 43.4 eski kısmi anchor çağrısı disable ----
+_orig_swap_step43 = SwapEngineRunner.step
+
+def _swap_step43(self, symbol, snap, signals, weights, regime, sent, prices_spot, ind=None):
+    # 29C/40 zincirindeki anchor çağrısı artık cycle'daki TAM-fiyatlı
+    # 40B.1/41 sürümü tarafından yapılıyor; step içi çağrı kaldırıldı.
+    return _orig_swap_step43(self, symbol, snap, signals, weights, regime, sent,
+                             prices_spot, ind)
+
+SwapEngineRunner.step = _swap_step43
+LOG.info("[43.4] Anchor çağrısı tek noktaya indirildi (cycle'da tam fiyatlı).")
+
+# ---- rejim etiketi kaydı (43.1 kullanım) ----
+_orig_step_reg43 = SwapEngineRunner.step
+
+def _step_reg43(self, symbol, snap, signals, weights, regime, sent, prices_spot, ind=None):
+    self._last_regime43 = regime
+    return _orig_step_reg43(self, symbol, snap, signals, weights, regime, sent,
+                            prices_spot, ind)
+
+SwapEngineRunner.step = _step_reg43
+print("[BÖLÜM 43] AKTİF — genişletilmiş rejim + BTC şok koruması + "
+      "dinamik risk skaleri (yalnız azaltan) + tek nokta anchor.")    
 if __name__ == "__main__":
     main()
