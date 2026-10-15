@@ -6221,5 +6221,124 @@ print("[BÖLÜM 44] TAMAM — kilit artık süreli (4 saat); gün değişiminde 
 # ============================================================
 # NİHAİ BAŞLATMA
 # ============================================================
+# ============================================================
+# F1-P1 — KISMİ KAPATMA + EKLEME SARMALAYICISI (tek-blok sürüm)
+# Mevcut kod DEĞİŞMEDİ. Yeni yetenekler:
+#  - Portfolio.close(..., amount=) kısmi kapatma (MonkeyPatch)
+#  - Portfolio.buy_add_to_position(): mevcut pozisyona ekleme + avg maliyet
+#  - Limits: adds<=2, trend_down zararda ekleme YASAK, min 15m mum arası
+# Karar mantığı (bu özelliklerin TETİKLENMESİ) Parça-2'de (F1-P2) gelecek.
+# Şu an yalnız MEKANİZMA hazır — mevcut döngü davranışı BİREBİR AYNI.
+# ============================================================
+print("[F1-P1] Kismi-kapatma ve ekleme mekanizmasi yukleniyor...")
+
+from typing import Optional as _Optional
+import types as _types_f1
+
+# ---- 1) Portfolio.close: amount parametresi destekli sarmalayıcı ----
+_orig_f1_close = Portfolio.close
+
+def _f1_close(self, symbol, price, exit_fee, reason, ts=None,
+              amount: _Optional[float] = None):
+    if amount is None:
+        return _orig_f1_close(self, symbol, price, exit_fee, reason, ts)
+    pos = self.positions.get(symbol)
+    if not pos:
+        return None
+    amt = min(float(amount), pos.amount)
+    if amt <= 0:
+        return None
+    # kısmi kapatma: oranı hesapla, kitap değerlerini oranla dağıt
+    ratio = amt / pos.amount if pos.amount > 0 else 0.0
+    entry_fee_share = pos.fees_paid * ratio
+    gross = (price - pos.entry_price) * amt
+    exit_fee = exit_fee * ratio
+    net = gross - entry_fee_share - exit_fee
+    self.cash += amt * price - exit_fee
+    self.realized += net
+    self.fees += entry_fee_share + exit_fee
+    tr = TradeRecord(opened_at=pos.opened_at, closed_at=ts or time.time(),
+                     mode=self.mode, exchange=self.exchange, symbol=symbol,
+                     side=pos.side, amount=amt, entry_price=pos.entry_price,
+                     exit_price=price, gross_pnl=gross, fees=entry_fee_share + exit_fee,
+                     net_pnl=net, strategy=pos.strategy, close_reason=reason)
+    pos.amount -= amt
+    pos.fees_paid -= entry_fee_share
+    if pos.amount <= max(1e-12, amt * 1e-9):
+        self.positions.pop(symbol, None)
+    return tr
+
+Portfolio.close = _f1_close
+LOG.info("[F1] Portfolio.close: 'amount=' kısmi kapatma destekli (geriye-uyumlu).")
+
+# ---- 2) Portfolio.open_position: pozisyona ekleme (avg maliyet) ----
+_orig_f1_open = Portfolio.open_position
+
+def _f1_open(self, symbol, amount, price, fee, sl, tp, strategy, ts,
+             add_if_exists: bool = False):
+    if add_if_exists and symbol in self.positions:
+        pos = self.positions[symbol]
+        add_cost = amount * price + fee
+        total_cost = (pos.entry_price * pos.amount) + (price * amount)
+        pos.amount += amount
+        pos.entry_price = total_cost / pos.amount if pos.amount > 0 else price
+        pos.fees_paid += fee
+        pos.adds = getattr(pos, "adds", 0) + 1
+        self.cash -= add_cost
+        LOG.info("[F1][%s] POZİSYONA EKLEME: +%s → toplam %.8f | yeni ort=%s",
+                 symbol, amount, pos.amount, fmt_money(pos.entry_price))
+        return pos
+    return _orig_f1_open(self, symbol, amount, price, fee, sl, tp, strategy, ts)
+
+Portfolio.open_position = _f1_open
+LOG.info("[F1] Portfolio.open_position: 'add_if_exists=' ekleme destekli.")
+
+# ---- 3) Position.adds alanı (monkeypatch ile yedeklenmiş open bunu üretir) ----
+# (Position dataclass'ı değiştirilmedi; add_if_exists ile açık pozisyona ekleme
+#  yukarıdaki sarmalayıcıda sayaç pozisyonun attribute'una dinamik yazılıyor.)
+
+# ---- 4) SWAP tarafı: close_futures'a da amount sarmalayıcı ----
+_orig_f1_fclose = FuturesPortfolio.close_futures
+
+def _f1_fclose(self, symbol, price, exit_fee, reason, ts=None,
+               amount: _Optional[float] = None):
+    pos = self.positions.get(symbol)
+    if not pos:
+        return None
+    if amount is None or amount >= pos.amount:
+        return _orig_f1_fclose(self, symbol, price, exit_fee, reason, ts)
+    amt = min(float(amount), pos.amount)
+    ratio = amt / pos.amount if pos.amount > 0 else 0.0
+    entry_fee_share = pos.fees_paid * ratio
+    if pos.side == "short":
+        gross = (pos.entry_price - price) * amt
+    else:
+        gross = (price - pos.entry_price) * amt
+    exit_fee = exit_fee * ratio
+    net = gross - entry_fee_share - exit_fee
+    self.cash += gross - exit_fee
+    self.realized += net
+    self.fees += entry_fee_share + exit_fee
+    tr = TradeRecord(opened_at=pos.opened_at, closed_at=ts or time.time(),
+                     mode=self.mode, exchange=self.exchange, symbol=symbol,
+                     side=pos.side, amount=amt, entry_price=pos.entry_price,
+                     exit_price=price, gross_pnl=gross, fees=entry_fee_share + exit_fee,
+                     net_pnl=net, strategy=pos.strategy, close_reason=reason)
+    pos.amount -= amt
+    pos.fees_paid -= entry_fee_share
+    if pos.amount <= max(1e-12, amt * 1e-9):
+        self.positions.pop(symbol, None)
+    return tr
+
+FuturesPortfolio.close_futures = _f1_fclose
+LOG.info("[F1] FuturesPortfolio.close_futures: 'amount=' kısmi kapatma destekli.")
+
+# ---- 5) Limitler (F1-P2 karar mantığı için hazır sabitler) ----
+F1_MAX_ADDS = int(safe_float(os.environ.get("F1_MAX_ADDS"), 2) or 2)
+F1_MIN_HOLD_SEC_BETWEEN_ADDS = safe_float(os.environ.get("F1_ADD_GAP"), 900.0) or 900.0
+LOG.info("[F1] Limitler: max_adds=%d, ekleme-arası min %.0f sn.",
+         F1_MAX_ADDS, F1_MIN_HOLD_SEC_BETWEEN_ADDS)
+
+print("[F1-P1] TAMAM — mekanizma hazır; tetikleyici karar mantığı F1-P2'de.")
 if __name__ == "__main__":
     main()
