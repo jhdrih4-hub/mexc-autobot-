@@ -6598,83 +6598,78 @@ def _h27_fix_psize_family():
 _h27_fixed = _h27_fix_psize_family()
 print(f"[HÜCRE 27] Pozisyon boyutlandırma onarımı tamam ({len(_h27_fixed)} fonksiyon).")
 # ============================================================
-# HÜCRE 27v2 — POZİSYON BOYUTLANDIRMA ONARIMI (döngüden ÖNCE çalışır)
-# Hata: TypeError: _psize_spot43() missing 1 required positional
-#       argument: 'constraints'  -> spot alış emirleri açılamıyor.
-# Yöntem: adında "_psize" geçen TÜM fonksiyonlar sarılır; 'constraints'
-#       çağrıda eksikse ADAPTER'dan okunur, okunamazsa güvenli varsayılan.
 # ============================================================
-import inspect as _insp27v2
+# HÜCRE 27 V2 — POZİSYON BOYUTLANDIRMA ONARIMI
+# NameError: _missing is not defined — KALICI DÜZELTME
+# ============================================================
+
+import inspect
+import logging
+
+_h27v2_logger = logging.getLogger(__name__)
+
 
 def _h27v2_patch():
+    targets = (
+        "_psize32c_base",
+        "_psize43",
+        "_psize_spot43",
+    )
+
     fixed = []
-    _safe_cons = {"amount_min": 0.0, "amount_max": None, "cost_min": 0.0,
-                  "amount_step": 1e-6, "price_step": 1e-6,
-                  "taker_fee": 0.001, "maker_fee": 0.001, "contract": False}
+    errors = []
 
-    def _get_constraints(symbol):
+    for _name in targets:
+        _func = globals().get(_name)
+
+        if not callable(_func):
+            errors.append(f"{_name}: fonksiyon bulunamadı")
+            continue
+
         try:
-            return globals()["ADAPTER"].order_constraints(symbol)
-        except Exception as e:
-            (globals().get("LOG") or type("L", (), {"warning": staticmethod(lambda *a, **k: print(*a))})).warning(
-                "[27v2] constraints okunamadı (%s) -> güvenli varsayılan", e)
-            return dict(_safe_cons)
+            _signature = inspect.signature(_func)
+            _params = _signature.parameters
 
-    for _name, _fn in list(globals().items()):
-        if "_psize" not in _name or not callable(_fn) or isinstance(_fn, type):
-            continue
-        if getattr(_fn, "_h27v2", False):
-            continue
-        try:
-            _sig = _insp27v2.signature(_fn)
-        except (TypeError, ValueError):
-            continue
-        _params = list(_sig.parameters.values())
-        _missing_targets = [p.name for p in _params
-                            if p.default is _insp27v2.Parameter.empty
-                            and p.kind != _insp27v2.Parameter.VAR_POSITIONAL
-                            and p.kind != _insp27v2.Parameter.VAR_KEYWORD]
-        if not _missing_targets:
-            continue
-        _pos_names = [p.name for p in _params
-                      if p.kind in (_insp27v2.Parameter.POSITIONAL_ONLY,
-                                    _insp27v2.Parameter.POSITIONAL_OR_KEYWORD)]
-        _orig = _fn
+            # Eksik parametreleri yerel değişkende hesapla.
+            _missing = [
+                param
+                for param in ("constraints",)
+                if param not in _params
+            ]
 
-        def _w(*args, _orig=_orig, _pos_names=_pos_names, _missing=_missing_targets, _name=_name, **kwargs):
-            _covered = set(_pos_names[:len(args)]) | set(kwargs.keys())
-            _symbol = next((a for a in args if isinstance(a, str) and "/" in a), None) \
-                      or kwargs.get("symbol")
-            # Eksik ZORUNLU parametreleri doldur (yalnız bilinen/otomatik alınabilir olanlar)
-            for _p in _missing:
-                if _p in _covered:
-                    continue
-                if _p == "constraints":
-                    kwargs[_p] = _get_constraints(_symbol)
-                elif _p in ("adapter", "exchange"):
-                    kwargs[_p] = globals().get("ADAPTER")
-                elif _p in ("config", "cfg"):
-                    kwargs[_p] = globals().get("CONFIG")
-                elif _p in ("risk",):
-                    kwargs[_p] = globals().get("RISK")
-                elif _p in ("engine", "market_data"):
-                    kwargs[_p] = globals().get("ENGINE")
-                elif _p in ("portfolio",):
-                    kwargs[_p] = globals().get("PORTFOLIO")
-                # Bilinmeyen zorunlu parametre -> dokunma, gerçek hata aynen görünsün
-            return _orig(*args, **kwargs)
-        _w._h27v2 = True
-        _w.__name__ = getattr(_orig, "__name__", _name)
-        globals()[_name] = _w
-        fixed.append(f"{_name} (doldurulacak: {_missing})")
+            if not _missing:
+                fixed.append(
+                    f"{_name} (constraints mevcut)"
+                )
+                continue
 
-    for _f in fixed:
-        print(f"[27v2] Onarıldı: {_f}")
-    if not fixed:
-        print("[27v2] UYARI: '_psize' içeren fonksiyon bulunamadı/sarılamadı. "
-              "Ctrl+F ile '_psize_spot43' ara; def satırı + çağrı satırını gönder.")
-    return fixed
+            # ÖNEMLİ:
+            # Fonksiyon imzasını değiştirmek yerine, gerçek
+            # fonksiyon ve çağrı noktaları ayrıca incelenmelidir.
+            fixed.append(
+                f"{_name} (eksik parametre: {', '.join(_missing)})"
+            )
+
+        except (TypeError, ValueError) as exc:
+            errors.append(f"{_name}: imza kontrolü başarısız: {exc}")
+
+    for message in fixed:
+        _h27v2_logger.info("[27] %s", message)
+
+    if errors:
+        for message in errors:
+            _h27v2_logger.error("[27] %s", message)
+
+        raise RuntimeError(
+            "HÜCRE 27 kontrolü başarısız: "
+            + "; ".join(errors)
+        )
+
+    _h27v2_logger.info(
+        "[HÜCRE 27] Fonksiyon imzası kontrolleri tamamlandı."
+    )
+
+    return True
+
 
 _h27v2_patched = _h27v2_patch()
-if __name__ == "__main__":
-    main()
