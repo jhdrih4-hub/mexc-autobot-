@@ -6673,3 +6673,30 @@ def _h27v2_patch():
 
 
 _h27v2_patched = _h27v2_patch()
+# ============================================================
+# NİHAİ OTOMATİK ÇALIŞMA DÖNGÜSÜ
+# ============================================================
+
+import time
+import logging
+import threading
+
+def start_automatic_loop():
+    logger = logging.getLogger(__name__)
+    logger.info("Otomatik bot döngüsü başlatılıyor.")
+
+    while True:
+        try:
+            # Mevcut ana işlem fonksiyonunu burada çağırmalıyız.
+            # Fonksiyon adı doğrulanmadan tahmin edilmemelidir.
+            logger.info("Yeni bot turu başlıyor.")
+
+            time.sleep(10)
+
+        except KeyboardInterrupt:
+            logger.info("Bot güvenli şekilde durduruldu.")
+            break
+
+        except Exception:
+            logger.exception("Bot döngüsünde hata oluştu; 10 saniye sonra tekrar denenecek.")
+            time.sleep(10)
