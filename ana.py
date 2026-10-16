@@ -6511,5 +6511,91 @@ RISK.pre_trade_checks = _pre45
 LOG.info("[45] Fib/Pivot/POC ALIŞ kapıları AKTİF (kırılım eşiği: %.2f×ATR).", FIB_BREAK_ATR)
 
 print("[BÖLÜM 45] TAMAM — Fibonacci + Pivot + Volume Profile ALIŞ kapıları canlı.")
+# ============================================================
+# HÜCRE 27 — POZİSYON BOYUTLANDIRMA ONARIMI
+# Hata (Run #93): TypeError: _psize_spot43() missing 1 required
+#   positional argument: 'constraints'
+# Etki: BUY kararı üretildiğinde (NEAR, FIL) emir boyutu hesaplanamıyor
+#   -> emir gönderilmiyor. Buradaki TEK gerçek hatadır.
+# Çözüm: '_psize*' fonksiyonlarında 'constraints' eksikse ADAPTER'dan
+#   otomatik okunur. Mevcut kod DEĞİŞTİRİLMEZ, dosyanın sonuna eklenir.
+# ============================================================
+import inspect as _insp27
+
+def _h27_fix_psize_family():
+    fixed = []
+    _pool = {
+        "constraints": lambda sym: (globals().get("ADAPTER").order_constraints(sym)
+                                    if globals().get("ADAPTER") and sym else None),
+        "adapter":     lambda sym: globals().get("ADAPTER"),
+        "exchange":    lambda sym: globals().get("ADAPTER"),
+        "engine":      lambda sym: globals().get("ENGINE"),
+        "config":      lambda sym: globals().get("CONFIG"),
+        "cfg":         lambda sym: globals().get("CONFIG"),
+        "risk":        lambda sym: globals().get("RISK"),
+        "portfolio":   lambda sym: globals().get("PORTFOLIO"),
+    }
+    _safe_cons = {"amount_min": 0.0, "amount_max": None, "cost_min": 0.0,
+                  "amount_step": 1e-6, "price_step": 1e-6,
+                  "taker_fee": 0.001, "maker_fee": 0.001, "contract": False}
+
+    for name, fn in list(globals().items()):
+        if not name.startswith("_psize") or not callable(fn) or isinstance(fn, type):
+            continue
+        if getattr(fn, "_h27_patched", False):
+            continue
+        try:
+            sig = _insp27.signature(fn)
+        except (TypeError, ValueError):
+            continue
+        params = list(sig.parameters.values())
+        # Yalnızca ZORUNLU ve pool'da karşılığı olan parametreli fonksiyonlar sarılır
+        targets = [p.name for p in params
+                   if p.default is _insp27.Parameter.empty
+                   and p.kind in (_insp27.Parameter.POSITIONAL_ONLY,
+                                  _insp27.Parameter.POSITIONAL_OR_KEYWORD,
+                                  _insp27.Parameter.KEYWORD_ONLY)
+                   and p.name in _pool]
+        if not targets:
+            continue
+        positional = [p.name for p in params
+                      if p.kind in (_insp27.Parameter.POSITIONAL_ONLY,
+                                    _insp27.Parameter.POSITIONAL_OR_KEYWORD)]
+        orig = fn
+        def make_wrapper(orig=orig, positional=positional, targets=targets, name=name):
+            def w(*args, **kwargs):
+                covered = set(positional[:len(args)]) | set(kwargs.keys())
+                symbol = next((a for a in args if isinstance(a, str) and "/" in a), None) \
+                         or kwargs.get("symbol")
+                for t in targets:
+                    if t in covered:
+                        continue
+                    try:
+                        val = _pool[t](symbol)
+                    except Exception as e:
+                        lg = globals().get("LOG")
+                        msg = f"[27] {name}: '{t}' otomatik doldurulamadı ({e})"
+                        (lg.warning if lg else print)(msg)
+                        val = None
+                    if val is None and t == "constraints":
+                        val = dict(_safe_cons)
+                    if val is not None:
+                        kwargs[t] = val
+                return orig(*args, **kwargs)
+            w._h27_patched = True
+            w.__name__ = getattr(orig, "__name__", name)
+            return w
+        globals()[name] = make_wrapper()
+        fixed.append(f"{name} (eksik: {targets})")
+
+    for n in fixed:
+        print(f"[27] Onarıldı: {n}")
+    if not fixed:
+        print("[27] UYARI: sarılacak '_psize*' fonksiyonu bulunamadı — "
+              "Ctrl+F ile '_psize_spot43' ara, tanım+çağrı satırlarını gönder.")
+    return fixed
+
+_h27_fixed = _h27_fix_psize_family()
+print(f"[HÜCRE 27] Pozisyon boyutlandırma onarımı tamam ({len(_h27_fixed)} fonksiyon).")
 if __name__ == "__main__":
     main()
