@@ -6700,3 +6700,13 @@ def start_automatic_loop():
         except Exception:
             logger.exception("Bot döngüsünde hata oluştu; 10 saniye sonra tekrar denenecek.")
             time.sleep(10)
+    for _name, _fn in list(globals().items()):
+        if "_psize" not in _name or not callable(_fn) or isinstance(_fn, type):
+            continue
+        # --- ZATEN İLK YAMA TARAFINDAN SARILMIŞ MI? ---
+        if getattr(_fn, "_h27_patched", False):
+            print(f"[27v2] ATLANDI: {_name} (ilk yama zaten sarmış)")
+            continue
+        if getattr(_fn, "_h27v2", False):
+            continue
+        # ... geri kalan kod ...
