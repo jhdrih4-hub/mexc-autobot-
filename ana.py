@@ -6598,115 +6598,116 @@ def _h27_fix_psize_family():
 _h27_fixed = _h27_fix_psize_family()
 print(f"[HÜCRE 27] Pozisyon boyutlandırma onarımı tamam ({len(_h27_fixed)} fonksiyon).")
 # ============================================================
+# HÜCRE 27 — POZİSYON BOYUTLANDIRMA ONARIMI (TEK PARÇA)
+# Hata (Run #93): TypeError: _psize_spot43() missing 1 required
+#   positional argument: 'constraints' -> spot alış emirleri
+#   açılamıyor.
+# Çözüm: adında "_psize" geçen fonksiyonlar sarılır. Çağrıda eksik
+#   zorunlu parametreler (constraints/adapter/config/risk/engine/
+#   portfolio) otomatik ADAPTER/CONFIG/RISK/ENGINE/PORTFOLIO'dan
+#   okunarak enjekte edilir. okunamazsa güvenli varsayılan kullanılır.
+# Not: Bu blok dosyada _h27_fix_psize_family() VE _h27v2_patch()
+#   bloklarının TAMAMININ yerine geçer. Öncekileri sil, bunu yapıştır.
 # ============================================================
-# HÜCRE 27 V2 — POZİSYON BOYUTLANDIRMA ONARIMI
-# NameError: _missing is not defined — KALICI DÜZELTME
-# ============================================================
+import inspect as _insp27
 
-import inspect
-import logging
-
-_h27v2_logger = logging.getLogger(__name__)
-
-
-def _h27v2_patch():
-    targets = (
-        "_psize32c_base",
-        "_psize43",
-        "_psize_spot43",
-    )
-
+def _h27_patch():
     fixed = []
-    errors = []
+    _safe_cons = {
+        "amount_min": 0.0, "amount_max": None, "cost_min": 0.0,
+        "amount_step": 1e-6, "price_step": 1e-6,
+        "taker_fee": 0.001, "maker_fee": 0.001, "contract": False,
+    }
 
-    for _name in targets:
-        _func = globals().get(_name)
-
-        if not callable(_func):
-            errors.append(f"{_name}: fonksiyon bulunamadı")
-            continue
-
+    def _get_constraints(symbol):
         try:
-            _signature = inspect.signature(_func)
-            _params = _signature.parameters
+            return globals()["ADAPTER"].order_constraints(symbol)
+        except Exception as e:
+            _lg = globals().get("LOG")
+            if _lg is not None:
+                _lg.warning("[27] constraints okunamadı (%s) -> güvenli varsayılan", e)
+            return dict(_safe_cons)
 
-            # Eksik parametreleri yerel değişkende hesapla.
-            _missing = [
-                param
-                for param in ("constraints",)
-                if param not in _params
-            ]
+    _resolver = {
+        "constraints": lambda sym: _get_constraints(sym),
+        "adapter":     lambda sym: globals().get("ADAPTER"),
+        "exchange":    lambda sym: globals().get("ADAPTER"),
+        "config":      lambda sym: globals().get("CONFIG"),
+        "cfg":         lambda sym: globals().get("CONFIG"),
+        "risk":        lambda sym: globals().get("RISK"),
+        "engine":      lambda sym: globals().get("ENGINE"),
+        "market_data": lambda sym: globals().get("ENGINE"),
+        "portfolio":   lambda sym: globals().get("PORTFOLIO"),
+    }
 
-            if not _missing:
-                fixed.append(
-                    f"{_name} (constraints mevcut)"
-                )
-                continue
-
-            # ÖNEMLİ:
-            # Fonksiyon imzasını değiştirmek yerine, gerçek
-            # fonksiyon ve çağrı noktaları ayrıca incelenmelidir.
-            fixed.append(
-                f"{_name} (eksik parametre: {', '.join(_missing)})"
-            )
-
-        except (TypeError, ValueError) as exc:
-            errors.append(f"{_name}: imza kontrolü başarısız: {exc}")
-
-    for message in fixed:
-        _h27v2_logger.info("[27] %s", message)
-
-    if errors:
-        for message in errors:
-            _h27v2_logger.error("[27] %s", message)
-
-        raise RuntimeError(
-            "HÜCRE 27 kontrolü başarısız: "
-            + "; ".join(errors)
-        )
-
-    _h27v2_logger.info(
-        "[HÜCRE 27] Fonksiyon imzası kontrolleri tamamlandı."
-    )
-
-    return True
-
-
-_h27v2_patched = _h27v2_patch()
-# ============================================================
-# NİHAİ OTOMATİK ÇALIŞMA DÖNGÜSÜ
-# ============================================================
-
-import time
-import logging
-import threading
-
-def start_automatic_loop():
-    logger = logging.getLogger(__name__)
-    logger.info("Otomatik bot döngüsü başlatılıyor.")
-
-    while True:
-        try:
-            # Mevcut ana işlem fonksiyonunu burada çağırmalıyız.
-            # Fonksiyon adı doğrulanmadan tahmin edilmemelidir.
-            logger.info("Yeni bot turu başlıyor.")
-
-            time.sleep(10)
-
-        except KeyboardInterrupt:
-            logger.info("Bot güvenli şekilde durduruldu.")
-            break
-
-        except Exception:
-            logger.exception("Bot döngüsünde hata oluştu; 10 saniye sonra tekrar denenecek.")
-            time.sleep(10)
     for _name, _fn in list(globals().items()):
         if "_psize" not in _name or not callable(_fn) or isinstance(_fn, type):
             continue
-        # --- ZATEN İLK YAMA TARAFINDAN SARILMIŞ MI? ---
         if getattr(_fn, "_h27_patched", False):
-            print(f"[27v2] ATLANDI: {_name} (ilk yama zaten sarmış)")
+            # Daha önce sarılmış — atla, tekrar sarma (özyineleme önlemi)
             continue
-        if getattr(_fn, "_h27v2", False):
+        try:
+            _sig = _insp27.signature(_fn)
+        except (TypeError, ValueError):
             continue
-        # ... geri kalan kod ...
+
+        _params = list(_sig.parameters.values())
+        _missing_targets = [
+            p.name for p in _params
+            if p.default is _insp27.Parameter.empty
+            and p.kind not in (_insp27.Parameter.VAR_POSITIONAL,
+                               _insp27.Parameter.VAR_KEYWORD)
+            and p.name in _resolver
+        ]
+        if not _missing_targets:
+            # Otomatik doldurulabilecek zorunlu parametre yok — atla
+            continue
+
+        _pos_names = [
+            p.name for p in _params
+            if p.kind in (_insp27.Parameter.POSITIONAL_ONLY,
+                          _insp27.Parameter.POSITIONAL_OR_KEYWORD)
+        ]
+        _orig = _fn
+
+        def _w(*args, _orig=_orig, _pos_names=_pos_names,
+               _missing=_missing_targets, _name=_name, **kwargs):
+            _covered = set(_pos_names[:len(args)]) | set(kwargs.keys())
+            _symbol = next((a for a in args
+                            if isinstance(a, str) and "/" in a), None) \
+                      or kwargs.get("symbol")
+            for _p in _missing:
+                if _p in _covered:
+                    continue
+                try:
+                    _val = _resolver[_p](_symbol)
+                except Exception as e:
+                    _lg = globals().get("LOG")
+                    if _lg is not None:
+                        _lg.warning("[27] %s: '%s' otomatik doldurulamadı (%s)",
+                                    _name, _p, e)
+                    _val = None
+                if _val is not None:
+                    kwargs[_p] = _val
+            return _orig(*args, **kwargs)
+
+        _w._h27_patched = True
+        _w.__name__ = getattr(_orig, "__name__", _name)
+        globals()[_name] = _w
+        fixed.append((_name, _missing_targets))
+
+    # --- Rapor ---
+    for _f_name, _f_missing in fixed:
+        print(f"[27] Onarıldı: {_f_name} (eksik: {_f_missing})")
+    if not fixed:
+        print("[27] UYARI: sarılacak '_psize' fonksiyonu bulunamadı. "
+              "Ctrl+F ile '_psize_spot43' ara; def satırı + çağrı satırını gönder.")
+    return fixed
+
+
+_h27_fixed = _h27_patch()
+print(f"[HÜCRE 27] Pozisyon boyutlandırma onarımı tamam "
+      f"({len(_h27_fixed)} fonksiyon).")
+
+if __name__ == "__main__":
+    main()
